@@ -1,0 +1,82 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #0f1115;
+  color: #e4e6eb;
+}
+a { color: #6ea8fe; }
+
+.layout { display: flex; min-height: 100vh; }
+.sidebar {
+  width: 200px;
+  background: #14171f;
+  padding: 20px 12px;
+  border-right: 1px solid #232733;
+}
+.sidebar h1 { font-size: 15px; margin: 0 0 20px; color: #9aa4b2; }
+.sidebar nav a {
+  display: block;
+  padding: 8px 10px;
+  border-radius: 6px;
+  color: #e4e6eb;
+  text-decoration: none;
+  margin-bottom: 4px;
+  font-size: 14px;
+}
+.sidebar nav a:hover, .sidebar nav a.active { background: #1f2430; }
+.main { flex: 1; padding: 28px 32px; max-width: 1100px; }
+
+.login-box {
+  max-width: 320px;
+  margin: 120px auto;
+  padding: 28px;
+  background: #14171f;
+  border-radius: 10px;
+  border: 1px solid #232733;
+}
+input {
+  width: 100%;
+  padding: 10px;
+  margin: 8px 0 16px;
+  background: #0f1115;
+  border: 1px solid #2a2f3d;
+  border-radius: 6px;
+  color: #e4e6eb;
+  font-size: 14px;
+}
+button {
+  padding: 8px 14px;
+  background: #3b6ef6;
+  border: none;
+  border-radius: 6px;
+  color: white;
+  font-size: 14px;
+  cursor: pointer;
+}
+button:hover { background: #2f5ad9; }
+button.danger { background: #b0362a; }
+button.danger:hover { background: #922b21; }
+button.ghost { background: transparent; border: 1px solid #2a2f3d; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #232733; }
+th { color: #9aa4b2; font-weight: 500; }
+tr:hover td { background: #171b24; }
+
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
+.stat-card { background: #14171f; border: 1px solid #232733; border-radius: 8px; padding: 16px; }
+.stat-card .value { font-size: 26px; font-weight: 600; }
+.stat-card .label { color: #9aa4b2; font-size: 12px; margin-top: 4px; }
+
+.badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+.badge.pending { background: #3d3616; color: #fbbf24; }
+.badge.active { background: #163d2c; color: #4ade80; }
+.badge.banned { background: #3d1620; color: #f87171; }
+.badge.admin { background: #3d2f16; color: #fbbf24; }
+
+.error { color: #f87171; margin: 12px 0; }
+.muted { color: #9aa4b2; font-size: 13px; }
+.section { margin-bottom: 28px; }
+.section h2 { font-size: 16px; margin-bottom: 12px; }
+.back-link { display: inline-block; margin-bottom: 16px; font-size: 13px; }

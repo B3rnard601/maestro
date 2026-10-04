@@ -1,0 +1,17 @@
+{
+  "name": "maestro-admin-server",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.1",
+    "better-sqlite3": "^11.5.0",
+    "jsonwebtoken": "^9.0.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "@solana/web3.js": "^1.95.3",
+    "ethers": "^6.13.4"
+  }
+}
