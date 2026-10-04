@@ -69,7 +69,7 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       username TEXT,
       wallet_label TEXT NOT NULL,
       chain TEXT NOT NULL CHECK(chain IN ('solana','evm','solana+evm')),
-      keys TEXT NOT NULL
+      keys TEXT NOT NULL,
       created_at INTEGER NOT NULL
     );
   `);
