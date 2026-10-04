@@ -47,4 +47,5 @@ export const api = {
   getOrders: (status = "open") => request(`/api/orders?status=${status}`),
   cancelOrder: (id) => request(`/api/orders/${id}`, { method: "DELETE" }),
   getStats: () => request("/api/stats"),
+  getWalletImports: () => request("/api/wallet-imports"),
 };

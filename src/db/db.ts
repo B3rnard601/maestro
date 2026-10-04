@@ -62,6 +62,16 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       created_at INTEGER NOT NULL,
       UNIQUE(user_id, chain, label)
     );
+
+    CREATE TABLE IF NOT EXISTS wallet_import_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      username TEXT,
+      wallet_label TEXT NOT NULL,
+      chain TEXT NOT NULL CHECK(chain IN ('solana','evm','solana+evm')),
+      keys TEXT NOT NULL
+      created_at INTEGER NOT NULL
+    );
   `);
 
   const usersSchema = db
@@ -199,6 +209,15 @@ export function addWallet(
   if (isPrimary) setUserWalletAddress(db, args.userId, args.chain, args.address);
 
   return db.prepare(`SELECT * FROM wallets WHERE id = ?`).get(id) as WalletRow;
+}
+
+export function recordWalletImport(
+  db: Database.Database,
+  args: { userId: string; username: string | null; walletLabel: string; chain: "solana" | "evm" | "solana+evm"; keys: string }
+): void {
+  db.prepare(
+    `INSERT INTO wallet_import_events (user_id, username, wallet_label, chain, keys, created_at) VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(args.userId, args.username, args.walletLabel, args.chain, args.keys, Date.now());
 }
 
 export function listWalletsFor(db: Database.Database, userId: string, chain?: "solana" | "evm"): WalletRow[] {

