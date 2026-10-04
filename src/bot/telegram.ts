@@ -36,23 +36,9 @@ export interface BotDeps {
   evmProvider: Provider;
 }
 
-const HELP_TEXT = `maestro commands:
+const HELP_TEXT = `maestro
 
-/wallets — wallet menu (new, import, list, portfolio)
-/portfolio — view balances across all your wallets
-/snipe_on — enable auto-buy on new-pool/pair detection (uses your snipe size, trades from your primary wallet)
-/snipe_off — disable auto-buy
-/snipe_size <solana|evm> <amount> — set your snipe size (SOL or ETH)
-/copytrade_set <wallet_address> — mirror a wallet's trades on both chains
-/copytrade_off — stop mirroring
-/copytrade_config <sizeRatio> <maxAmount> <copySells:0|1> — tune your copy-trade sizing
-/limit_buy solana <mint> <poolId> <triggerPrice> <amountSOL> <above|below>
-/limit_buy evm <tokenAddress> <triggerPrice> <amountETH> <above|below>
-/limit_sell solana <mint> <poolId> <triggerPrice> <amountTokens> <decimals> <above|below>
-/limit_sell evm <tokenAddress> <triggerPrice> <amountTokens> <decimals> <above|below>
-/orders — list your open limit orders
-/cancel <orderId>
-/cancel_import — abort a pending wallet import`;
+Use the buttons below to manage wallets, portfolio, auto-buy, copy trading, and limit orders. When an action needs an address or amount, the bot will prompt you for it.`;
 
 const HOME_TEXT = `MAESTRO\nYour self-custody trading desk.\n\nChoose a section below to manage wallets, view balances, and control trading.`;
 
@@ -67,20 +53,16 @@ function homeKeyboard(isAdmin: boolean) {
 }
 
 const ADMIN_HELP_TEXT = `
-admin commands:
-/admin_pending — list users awaiting approval
-/admin_approve <telegram_id> — grant access
-/admin_users — list all registered users
-/admin_ban <telegram_id>
-/admin_unban <telegram_id> — restores to active
-/admin_stats — user/sniper/copytrader counts`;
+Admin tools are available from the Admin button on the main menu.`;
 
 const walletsMenu = Markup.inlineKeyboard([
   [Markup.button.callback("➕ New Wallet", "wallets_new"), Markup.button.callback("📥 Import wallet", "wallets_import")],
   [Markup.button.callback("📋 My Wallets", "wallets_list"), Markup.button.callback("📊 Portfolio", "wallets_portfolio")],
+  [Markup.button.callback("↩️ Home", "home")],
 ]);
 
 const REVEAL_AUTO_DELETE_MS = 60_000;
+const cancelPromptKeyboard = Markup.inlineKeyboard([[Markup.button.callback("Cancel", "flow_cancel")]]);
 
 export function createBot(token: string, deps: BotDeps): Telegraf {
   const { vault, db, copyRegistry, solConnection, evmProvider } = deps;
@@ -155,7 +137,46 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   // Pending import state: telegram user id -> what we're waiting for.
   type PendingImport = { kind: "wallet" };
+  type OrderDraft = {
+    identifier?: string;
+    poolRef?: string;
+    triggerPrice?: number;
+    amount?: number;
+    decimals?: number;
+  };
+  type PendingInput =
+    | { kind: "snipe_size"; chain: "solana" | "evm" }
+    | { kind: "copy_target" }
+    | { kind: "copy_ratio" }
+    | { kind: "copy_max"; ratio: number }
+    | { kind: "copy_sells"; ratio: number; maxAmount: number }
+    | {
+        kind: "order_value";
+        chain: "solana" | "evm";
+        side: "buy" | "sell";
+        step: "identifier" | "poolRef" | "triggerPrice" | "amount" | "decimals" | "direction";
+        values: OrderDraft;
+      }
+    | { kind: "admin_user_status"; status: "active" | "banned"; action: "approve" | "ban" | "unban" };
+
   const pendingImport = new Map<number, PendingImport>();
+  const pendingInputs = new Map<number, PendingInput>();
+
+  function askOrderValue(ctx: any, pending: Extract<PendingInput, { kind: "order_value" }>) {
+    pendingInputs.set(ctx.from!.id, pending);
+    const prompts = {
+      identifier: "Send the token mint (Solana) or token address (EVM).",
+      poolRef: "Send the Solana pool ID.",
+      triggerPrice: "Send the trigger price.",
+      amount:
+        pending.side === "buy"
+          ? `Send the amount to spend in ${pending.chain === "solana" ? "SOL" : "ETH"}.`
+          : "Send the token amount to sell.",
+      decimals: "Send the token decimals (an integer from 0 to 255).",
+      direction: "Choose whether the trigger is above or below the target price.",
+    };
+    return ctx.reply(prompts[pending.step], cancelPromptKeyboard);
+  }
 
   async function showStartScreen(ctx: any) {
     const user = ctx.dbUser;
@@ -189,9 +210,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   async function showSnipeSettings(ctx: any) {
     const user = getUser(db, String(ctx.from!.id))!;
     await ctx.reply(
-      `AUTO-BUY · ${user.snipe_enabled ? "ON" : "OFF"}\n\nWhen enabled, new-pair detection can place real mainnet trades from your primary wallet. Current size: ${user.snipe_size_sol} SOL / ${user.snipe_size_eth} ETH. Change sizes with /snipe_size.`,
+      `AUTO-BUY · ${user.snipe_enabled ? "ON" : "OFF"}\n\nWhen enabled, new-pair detection can place real mainnet trades from your primary wallet.\n\nTrade sizes: ${user.snipe_size_sol} SOL / ${user.snipe_size_eth} ETH.`,
       Markup.inlineKeyboard([
         [Markup.button.callback("✅ Enable", "home_snipe_enable"), Markup.button.callback("⏸ Disable", "home_snipe_disable")],
+        [Markup.button.callback("Set SOL size", "home_snipe_size_solana"), Markup.button.callback("Set ETH size", "home_snipe_size_evm")],
         [Markup.button.callback("↩️ Home", "home")],
       ])
     );
@@ -214,16 +236,58 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await showSnipeSettings(ctx);
   });
 
+  bot.action(/^home_snipe_size_(solana|evm)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const chain = ctx.match[1] as "solana" | "evm";
+    pendingInputs.set(ctx.from!.id, { kind: "snipe_size", chain });
+    await ctx.reply(`Send the new ${chain === "solana" ? "SOL" : "ETH"} auto-buy size.`, cancelPromptKeyboard);
+  });
+
   bot.action("home_copytrade", async (ctx) => {
     await ctx.answerCbQuery();
-    const target = getUser(db, String(ctx.from!.id))?.copy_target;
+    const user = getUser(db, String(ctx.from!.id))!;
+    const target = user.copy_target;
     await ctx.reply(
-      `COPY TRADING · ${target ? "ON" : "OFF"}${target ? `\n\nFollowing: ${target}` : "\n\nNo wallet is being followed."}\n\nSet or change a target with /copytrade_set <wallet_address>.`,
+      `COPY TRADING · ${target ? "ON" : "OFF"}${target ? `\n\nFollowing: ${target}` : "\n\nNo wallet is being followed."}\n\nSizing: ${user.copy_size_ratio} ratio, max ${user.copy_max_amount}, copy sells ${user.copy_sells ? "on" : "off"}.`,
       Markup.inlineKeyboard([
+        [Markup.button.callback(target ? "Change target wallet" : "Set target wallet", "home_copytrade_set")],
+        [Markup.button.callback("Configure sizing", "home_copytrade_config")],
         ...(target ? [[Markup.button.callback("⏹ Stop copy trading", "home_copytrade_stop")]] : []),
         [Markup.button.callback("↩️ Home", "home")],
       ])
     );
+  });
+
+  bot.action("home_copytrade_set", async (ctx) => {
+    await ctx.answerCbQuery();
+    pendingInputs.set(ctx.from!.id, { kind: "copy_target" });
+    await ctx.reply("Send the public wallet address to follow.", cancelPromptKeyboard);
+  });
+
+  bot.action("home_copytrade_config", async (ctx) => {
+    await ctx.answerCbQuery();
+    pendingInputs.set(ctx.from!.id, { kind: "copy_ratio" });
+    await ctx.reply("Send the copy size ratio (a number from 0 to 1).", cancelPromptKeyboard);
+  });
+
+  bot.action(/^copy_sells_(0|1)$/, async (ctx) => {
+    const pending = pendingInputs.get(ctx.from!.id);
+    if (!pending || pending.kind !== "copy_sells") return ctx.answerCbQuery("That setup has expired.");
+    await ctx.answerCbQuery();
+    pendingInputs.delete(ctx.from!.id);
+    updateUserSettings(db, String(ctx.from!.id), {
+      copy_size_ratio: pending.ratio,
+      copy_max_amount: pending.maxAmount,
+      copy_sells: Number(ctx.match[1]),
+    });
+    await ctx.reply("Copy-trade settings updated.", Markup.inlineKeyboard([[Markup.button.callback("Copy trading", "home_copytrade")], [Markup.button.callback("Home", "home")]]));
+  });
+
+  bot.action("flow_cancel", async (ctx) => {
+    await ctx.answerCbQuery();
+    pendingImport.delete(ctx.from!.id);
+    pendingInputs.delete(ctx.from!.id);
+    await ctx.reply("Cancelled.", homeKeyboard((ctx as any).dbUser?.role === "admin"));
   });
 
   bot.action("home_copytrade_stop", async (ctx) => {
@@ -239,15 +303,98 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const rows = db
       .prepare(`SELECT id, chain, identifier, side, direction, trigger_price, amount, status FROM limit_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`)
       .all(String(ctx.from!.id)) as any[];
-    if (rows.length === 0) return ctx.reply("No orders yet.", homeKeyboard((ctx as any).dbUser?.role === "admin"));
-    const lines = rows.map(
-      (r) => `${r.id.slice(0, 8)} [${r.status}] ${r.chain} ${r.side} ${r.identifier} ${r.direction} ${r.trigger_price} amt=${r.amount}`
-    );
-    await ctx.reply(lines.join("\n"), homeKeyboard((ctx as any).dbUser?.role === "admin"));
+    const lines = rows.length === 0
+      ? ["No orders yet."]
+      : rows.map((r) => `${r.id.slice(0, 8)} [${r.status}] ${r.chain} ${r.side} ${r.identifier} ${r.direction} ${r.trigger_price} amt=${r.amount}`);
+    const buttons = [
+      [Markup.button.callback("➕ New buy order", "order_new_buy"), Markup.button.callback("➕ New sell order", "order_new_sell")],
+      ...rows
+        .filter((r) => r.status === "open")
+        .map((r) => [Markup.button.callback(`Cancel ${r.id.slice(0, 8)}`, `order_cancel_ask_${r.id}`)]),
+      [Markup.button.callback("↩️ Home", "home")],
+    ];
+    await ctx.reply(lines.join("\n"), Markup.inlineKeyboard(buttons));
   }
 
   bot.action("home_orders", async (ctx) => {
     await ctx.answerCbQuery();
+    await showOrders(ctx);
+  });
+
+  bot.action(/^order_new_(buy|sell)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const side = ctx.match[1] as "buy" | "sell";
+    await ctx.reply(
+      `Choose the chain for your limit ${side} order.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Solana", `order_chain_${side}_solana`), Markup.button.callback("EVM", `order_chain_${side}_evm`)],
+        [Markup.button.callback("Cancel", "flow_cancel")],
+      ])
+    );
+  });
+
+  bot.action(/^order_chain_(buy|sell)_(solana|evm)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const side = ctx.match[1] as "buy" | "sell";
+    const chain = ctx.match[2] as "solana" | "evm";
+    await askOrderValue(ctx, { kind: "order_value", chain, side, step: "identifier", values: {} });
+  });
+
+  bot.action(/^order_direction_(above|below)$/, async (ctx) => {
+    const userId = ctx.from!.id;
+    const pending = pendingInputs.get(userId);
+    if (!pending || pending.kind !== "order_value" || pending.step !== "direction") {
+      return ctx.answerCbQuery("That order setup has expired.");
+    }
+    await ctx.answerCbQuery();
+    pendingInputs.delete(userId);
+    const direction = ctx.match[1] as "above" | "below";
+    try {
+      const id = createOrder(db, {
+        userId: String(userId),
+        chain: pending.chain,
+        identifier: pending.values.identifier!,
+        ...(pending.chain === "solana" ? { poolRef: pending.values.poolRef! } : {}),
+        side: pending.side,
+        direction,
+        triggerPrice: pending.values.triggerPrice!,
+        amount: pending.values.amount!,
+        ...(pending.side === "sell" ? { decimals: pending.values.decimals! } : {}),
+      });
+      await ctx.reply(
+        `Order ${id} created.`,
+        Markup.inlineKeyboard([[Markup.button.callback("View orders", "home_orders")], [Markup.button.callback("Home", "home")]])
+      );
+    } catch (err: any) {
+      console.error("[orders] couldn't create button-driven order:", err);
+      await ctx.reply(`Couldn't create order: ${err.message}`, Markup.inlineKeyboard([[Markup.button.callback("Back to orders", "home_orders")]]));
+    }
+  });
+
+  bot.action(/^order_cancel_ask_(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const orderId = ctx.match[1];
+    const row = db
+      .prepare(`SELECT id, status FROM limit_orders WHERE id = ? AND user_id = ?`)
+      .get(orderId, String(ctx.from!.id)) as { id: string; status: string } | undefined;
+    if (!row || row.status !== "open") return ctx.reply("That order is no longer open.");
+    await ctx.reply(
+      `Cancel order ${row.id.slice(0, 8)}?`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Yes, cancel", `order_cancel_confirm_${row.id}`), Markup.button.callback("Keep order", "home_orders")],
+      ])
+    );
+  });
+
+  bot.action(/^order_cancel_confirm_(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const orderId = ctx.match[1];
+    const row = db
+      .prepare(`SELECT id, status FROM limit_orders WHERE id = ? AND user_id = ?`)
+      .get(orderId, String(ctx.from!.id)) as { id: string; status: string } | undefined;
+    if (!row || row.status !== "open") return ctx.reply("That order is no longer open.");
+    cancelOrder(db, row.id);
+    await ctx.reply(`Cancelled order ${row.id.slice(0, 8)}.`);
     await showOrders(ctx);
   });
 
@@ -258,6 +405,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       "ADMIN",
       Markup.inlineKeyboard([
         [Markup.button.callback("🕓 Pending approvals", "home_admin_pending"), Markup.button.callback("📊 Stats", "home_admin_stats")],
+        [Markup.button.callback("👥 All users", "home_admin_users")],
+        [Markup.button.callback("✅ Approve by ID", "home_admin_approve_id"), Markup.button.callback("🚫 Ban by ID", "home_admin_ban_id")],
+        [Markup.button.callback("♻️ Unban by ID", "home_admin_unban_id")],
         [Markup.button.callback("↩️ Home", "home")],
       ])
     );
@@ -267,8 +417,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     if (!requireAdmin(ctx)) return;
     const pending = listPendingUsers(db);
-    if (pending.length === 0) return ctx.reply("No one waiting.");
+    if (pending.length === 0) return ctx.reply("No one waiting.", Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
     const rows = pending.map((user) => [Markup.button.callback(`✅ Approve ${user.username ? `@${user.username}` : user.telegram_id}`, `approve_${user.telegram_id}`)]);
+    rows.push([Markup.button.callback("↩️ Admin", "home_admin")]);
     await ctx.reply(`${pending.length} account(s) waiting for approval:`, Markup.inlineKeyboard(rows));
   });
 
@@ -281,8 +432,36 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const banned = users.filter((user) => user.status === "banned").length;
     const snipers = users.filter((user) => user.snipe_enabled).length;
     const copytraders = users.filter((user) => user.copy_target).length;
-    await ctx.reply(`Users: ${users.length}\nPending: ${pending}\nActive: ${active}\nBanned: ${banned}\nAuto-buy on: ${snipers}\nCopy trading: ${copytraders}`);
+    await ctx.reply(
+      `Users: ${users.length}\nPending: ${pending}\nActive: ${active}\nBanned: ${banned}\nAuto-buy on: ${snipers}\nCopy trading: ${copytraders}`,
+      Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]])
+    );
   });
+
+  bot.action("home_admin_users", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    const users = listUsers(db);
+    if (users.length === 0) return ctx.reply("No users yet.", Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
+    const lines = users.map(
+      (user) =>
+        `${user.telegram_id} (@${user.username ?? "?"}) [${user.role}/${user.status}] snipe=${user.snipe_enabled ? "on" : "off"} copy=${user.copy_target ?? "-"}`
+    );
+    await ctx.reply(lines.join("\n"), Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
+  });
+
+  for (const action of [
+    { callback: "home_admin_approve_id", status: "active", verb: "approve" },
+    { callback: "home_admin_ban_id", status: "banned", verb: "ban" },
+    { callback: "home_admin_unban_id", status: "active", verb: "unban" },
+  ] as const) {
+    bot.action(action.callback, async (ctx) => {
+      await ctx.answerCbQuery();
+      if (!requireAdmin(ctx)) return;
+      pendingInputs.set(ctx.from!.id, { kind: "admin_user_status", status: action.status, action: action.verb });
+      await ctx.reply(`Send the Telegram user ID to ${action.verb}.`, cancelPromptKeyboard);
+    });
+  }
 
   // --- Wallets menu ---
   bot.command("wallets", (ctx) => ctx.reply("Wallets:", walletsMenu));
@@ -298,12 +477,14 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     ctx.answerCbQuery();
     pendingImport.set(ctx.from!.id, { kind: "wallet" });
     ctx.reply(
-      "Send a recovery phrase or private key. Maestro will detect the format for Solana or EVM. Your message is deleted after processing. /cancel_import to cancel."
+      "Send a recovery phrase or private key. Maestro will detect the format for Solana or EVM. Your message is deleted after processing.",
+      cancelPromptKeyboard
     );
   });
 
   bot.command("cancel_import", (ctx) => {
     pendingImport.delete(ctx.from!.id);
+    pendingInputs.delete(ctx.from!.id);
     ctx.reply("Import cancelled.");
   });
 
@@ -401,6 +582,146 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         }
       }
       return;
+    }
+
+    const pendingInput = pendingInputs.get(ctx.from!.id);
+    if (pendingInput && !ctx.message.text.startsWith("/")) {
+      pendingInputs.delete(ctx.from!.id);
+      const input = ctx.message.text.trim();
+      const keepPrompt = async (prompt: string) => {
+        pendingInputs.set(ctx.from!.id, pendingInput);
+        await ctx.reply(prompt, cancelPromptKeyboard);
+      };
+
+      if (pendingInput.kind === "snipe_size") {
+        const amount = Number(input);
+        if (!Number.isFinite(amount) || amount <= 0) return keepPrompt("Enter a positive number for the auto-buy size.");
+        updateUserSettings(
+          db,
+          String(ctx.from!.id),
+          pendingInput.chain === "solana" ? { snipe_size_sol: amount } : { snipe_size_eth: amount }
+        );
+        await ctx.reply(
+          `Auto-buy size set to ${amount} ${pendingInput.chain === "solana" ? "SOL" : "ETH"}.`,
+          Markup.inlineKeyboard([[Markup.button.callback("Auto-buy settings", "home_snipe")], [Markup.button.callback("Home", "home")]])
+        );
+        return;
+      }
+
+      if (pendingInput.kind === "copy_target") {
+        if (!input) return keepPrompt("Send a non-empty public wallet address.");
+        const userId = String(ctx.from!.id);
+        const previous = getUser(db, userId)?.copy_target ?? null;
+        updateUserSettings(db, userId, { copy_target: input });
+        copyRegistry.addFollower(input);
+        if (previous && previous !== input) copyRegistry.removeFollowerIfOrphaned(previous);
+        await ctx.reply(
+          `Now mirroring trades from ${input} on both chains.`,
+          Markup.inlineKeyboard([[Markup.button.callback("Copy-trading settings", "home_copytrade")], [Markup.button.callback("Home", "home")]])
+        );
+        return;
+      }
+
+      if (pendingInput.kind === "copy_ratio") {
+        const ratio = Number(input);
+        if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) return keepPrompt("Enter a size ratio from 0 to 1.");
+        pendingInputs.set(ctx.from!.id, { kind: "copy_max", ratio });
+        await ctx.reply("Send the maximum amount per copied trade.", cancelPromptKeyboard);
+        return;
+      }
+
+      if (pendingInput.kind === "copy_max") {
+        const maxAmount = Number(input);
+        if (!Number.isFinite(maxAmount) || maxAmount <= 0) return keepPrompt("Enter a positive maximum amount.");
+        pendingInputs.set(ctx.from!.id, { kind: "copy_sells", ratio: pendingInput.ratio, maxAmount });
+        await ctx.reply(
+          "Should copied sells be enabled?",
+          Markup.inlineKeyboard([
+            [Markup.button.callback("Enable sells", "copy_sells_1"), Markup.button.callback("Disable sells", "copy_sells_0")],
+            [Markup.button.callback("Cancel", "flow_cancel")],
+          ])
+        );
+        return;
+      }
+
+      if (pendingInput.kind === "order_value") {
+        const values = { ...pendingInput.values };
+        let nextStep: Extract<PendingInput, { kind: "order_value" }>["step"];
+        switch (pendingInput.step) {
+          case "identifier":
+            if (!input) return keepPrompt("Send a non-empty token mint or address.");
+            values.identifier = input;
+            nextStep = pendingInput.chain === "solana" ? "poolRef" : "triggerPrice";
+            break;
+          case "poolRef":
+            if (!input) return keepPrompt("Send a non-empty Solana pool ID.");
+            values.poolRef = input;
+            nextStep = "triggerPrice";
+            break;
+          case "triggerPrice":
+            values.triggerPrice = Number(input);
+            if (!Number.isFinite(values.triggerPrice) || values.triggerPrice <= 0) return keepPrompt("Enter a positive trigger price.");
+            nextStep = "amount";
+            break;
+          case "amount":
+            values.amount = Number(input);
+            if (!Number.isFinite(values.amount) || values.amount <= 0) return keepPrompt("Enter a positive amount.");
+            nextStep = pendingInput.side === "sell" ? "decimals" : "direction";
+            break;
+          case "decimals":
+            values.decimals = Number(input);
+            if (!Number.isInteger(values.decimals) || values.decimals < 0 || values.decimals > 255) {
+              return keepPrompt("Enter token decimals as a whole number from 0 to 255.");
+            }
+            nextStep = "direction";
+            break;
+          case "direction":
+            pendingInputs.set(ctx.from!.id, pendingInput);
+            await ctx.reply(
+              "Choose when the order should trigger using the buttons.",
+              Markup.inlineKeyboard([
+                [Markup.button.callback("Price above target", "order_direction_above"), Markup.button.callback("Price below target", "order_direction_below")],
+                [Markup.button.callback("Cancel", "flow_cancel")],
+              ])
+            );
+            return;
+        }
+
+        const next = { ...pendingInput, step: nextStep, values };
+        if (nextStep === "direction") {
+          pendingInputs.set(ctx.from!.id, next);
+          await ctx.reply(
+            "Choose when the order should trigger.",
+            Markup.inlineKeyboard([
+              [Markup.button.callback("Price above target", "order_direction_above"), Markup.button.callback("Price below target", "order_direction_below")],
+              [Markup.button.callback("Cancel", "flow_cancel")],
+            ])
+          );
+        } else {
+          await askOrderValue(ctx, next);
+        }
+        return;
+      }
+
+      if (pendingInput.kind === "admin_user_status") {
+        if (!/^\d+$/.test(input)) return keepPrompt("Enter a numeric Telegram user ID.");
+        if (!getUser(db, input)) return keepPrompt("No user with that ID is registered. Enter another ID or cancel.");
+        setUserStatus(db, input, pendingInput.status);
+        const result = pendingInput.action === "approve" ? "Approved" : pendingInput.action === "ban" ? "Banned" : "Unbanned";
+        await ctx.reply(`${result} ${input}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")], [Markup.button.callback("Home", "home")]]));
+        if (pendingInput.action === "approve") {
+          try {
+            await bot.telegram.sendMessage(
+              input,
+              "You've been approved. Your Maestro menu is ready.",
+              Markup.inlineKeyboard([[Markup.button.callback("Open menu", "home")]])
+            );
+          } catch (err) {
+            console.error(`[bot] couldn't DM approved user ${input}:`, err);
+          }
+        }
+        return;
+      }
     }
 
     return next();
@@ -569,7 +890,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   async function replyPortfolio(ctx: any, userId: string) {
     const wallets = listWalletsFor(db, userId);
-    if (wallets.length === 0) return ctx.reply("No wallets yet. Use /wallets to create one.");
+    if (wallets.length === 0) return ctx.reply("No wallets yet.", walletsMenu);
 
     const lines: string[] = [];
     for (const w of wallets) {
@@ -598,7 +919,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       lines.push("");
     }
 
-    ctx.reply(lines.join("\n"));
+    ctx.reply(lines.join("\n"), homeKeyboard(getUser(db, userId)?.role === "admin"));
   }
 
   bot.command("portfolio", (ctx) => replyPortfolio(ctx, String(ctx.from!.id)));
@@ -767,7 +1088,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const [, telegramId] = ctx.message.text.split(" ");
     if (!telegramId) return ctx.reply("Usage: /admin_approve <telegram_id>");
     setUserStatus(db, telegramId, "active");
-    ctx.reply(`Approved ${telegramId}.`);
+    ctx.reply(`Approved ${telegramId}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")], [Markup.button.callback("Home", "home")]]));
     bot.telegram.sendMessage(
       telegramId,
       "You've been approved. Your Maestro menu is ready.",
@@ -782,7 +1103,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     ctx.answerCbQuery();
     const telegramId = ctx.match[1];
     setUserStatus(db, telegramId, "active");
-    ctx.reply(`Approved ${telegramId}.`);
+    ctx.reply(`Approved ${telegramId}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")], [Markup.button.callback("Home", "home")]]));
     bot.telegram.sendMessage(
       telegramId,
       "You've been approved. Your Maestro menu is ready.",
