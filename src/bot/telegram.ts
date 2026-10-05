@@ -44,6 +44,7 @@ import { executeBuy as executeSolanaBuy, executeSell as executeSolanaSell, quote
 import { executeBuy as executeEvmBuy, executeSell as executeEvmSell, quoteBuy as quoteEvmBuy, quoteSell as quoteEvmSell } from "../chains/evm/executor.js";
 import { assertBuyEntryEnabled, evaluateTradePolicy } from "../risk/policy.js";
 import { formatUnitsExact } from "../shared/amount.js";
+import { tradingHeading, tradingSide, tradingStatus, triggerDirection } from "./presentation.js";
 import type { Wallet as EvmWallet } from "ethers";
 import { beginTrackedTrade } from "../transactions/tracker.js";
 
@@ -99,12 +100,12 @@ const HELP_TEXT = `maestro
 
 Use the buttons below to manage wallets, portfolio, auto-buy, copy trading, and limit orders. When an action needs an address or amount, the bot will prompt you for it.`;
 
-const HOME_TEXT = `MAESTRO\nYour self-custody trading desk.\n\nChoose a section below to manage wallets, view balances, and control trading.`;
+const HOME_TEXT = `${tradingHeading("◆", "Maestro · on-chain trading")}\nYour self-custody trading desk.\n\nChoose a section below to manage wallets, view balances, and control trading.`;
 
 function homeKeyboard(isAdmin: boolean) {
   const rows = [
     [Markup.button.callback("💼 Wallets", "home_wallets"), Markup.button.callback("📊 Portfolio", "wallets_portfolio")],
-    [Markup.button.callback("🔄 Trade", "home_trade")],
+    [Markup.button.callback("⚡ Trade", "home_trade")],
     [Markup.button.callback("🎯 Auto-buy", "home_snipe"), Markup.button.callback("🔁 Copy trading", "home_copytrade")],
     [Markup.button.callback("⚙️ Trading settings", "home_risk_settings")],
     [Markup.button.callback("📈 Orders", "home_orders"), Markup.button.callback("🧾 Recent trades", "home_trades")],
@@ -473,7 +474,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.reply(
       "Choose a manual trade. Every trade requires a fresh quote and your explicit confirmation.",
       Markup.inlineKeyboard([
-        [Markup.button.callback("Buy", "trade_start_buy"), Markup.button.callback("Sell", "trade_start_sell")],
+        [Markup.button.callback("🟢 Buy", "trade_start_buy"), Markup.button.callback("🔴 Sell", "trade_start_sell")],
         [Markup.button.callback("↩️ Home", "home")],
       ])
     );
@@ -487,7 +488,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           const date = new Date(trade.created_at).toISOString().replace("T", " ").slice(0, 19);
           const ref = trade.transaction_ref ?? trade.approval_transaction_ref;
           const error = trade.error ? `\n  Note: ${trade.error}` : "";
-          return `${date} · ${trade.chain.toUpperCase()} ${trade.side.toUpperCase()} ${trade.amount} · ${trade.source} · ${trade.status.toUpperCase()}` +
+          return `${tradingSide(trade.side)} ${trade.amount} · ${trade.chain.toUpperCase()} · ${trade.source}\n${tradingStatus(trade.status)} · ${date}` +
             `${ref ? `\n  Tx: ${ref}` : ""}${trade.bundle_ref ? `\n  Bundle: ${trade.bundle_ref}` : ""}${error}`;
         });
     const jobText = jobs
@@ -495,13 +496,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       .map((job) => {
         const date = new Date(job.created_at).toISOString().replace("T", " ").slice(0, 19);
         const error = job.last_error ? `\n  Note: ${job.last_error}` : "";
-        return `${date} · ${job.chain.toUpperCase()} ${job.side.toUpperCase()} ${job.amount} · ${job.source} · QUEUE ${job.status.toUpperCase()} (${job.attempts}/${job.max_attempts})${error}`;
+        return `${tradingSide(job.side)} ${job.amount} · ${job.chain.toUpperCase()} · ${job.source}\n${tradingStatus(job.status)} · ${date} · ${job.attempts}/${job.max_attempts}${error}`;
       });
     const text = [...jobText, ...lifecycleText].length === 0
       ? "No tracked trades yet."
       : [...jobText, ...lifecycleText].join("\n\n");
     await ctx.reply(
-      `RECENT TRADES\n\n${text}\n\nUnknown means the RPC did not provide a final status in time; reconciliation continues.`,
+      `${tradingHeading("📈", "Recent trades")}\n${text}\n\n${tradingSide("buy")} · ${tradingSide("sell")}\nUnknown means the RPC did not provide a final status in time; reconciliation continues.`,
       Markup.inlineKeyboard([
         [Markup.button.callback("🔄 Refresh", "home_trades"), Markup.button.callback("🔄 Trade", "home_trade")],
         [Markup.button.callback("↩️ Home", "home")],
@@ -661,7 +662,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         source: "manual",
         details: { asset: quote.asset, poolId: quote.poolId ?? null, submissionId },
       });
-      await ctx.reply(`Trade submitted.\nTracking ID: ${lifecycle.id}\nTransaction: ${submissionId}`);
+      await ctx.reply(
+        `${tradingHeading("🟡", "Trade submitted")}\nTracking ID: ${lifecycle.id}\nTransaction: ${submissionId}`
+      );
     } catch (err) {
       lifecycle?.failIfNotSubmitted(err);
       console.error(`[trade] confirmed ${quote.chain} ${quote.side} failed for user ${quote.userId}:`, err);
@@ -841,11 +844,18 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         FROM limit_orders o LEFT JOIN trade_jobs j ON j.dedupe_key = 'limit_order:' || o.id
         WHERE o.user_id = ? ORDER BY o.created_at DESC LIMIT 20`)
       .all(String(ctx.from!.id)) as any[];
-    const lines = rows.length === 0
+    const lines = [
+      tradingHeading("📈", "Limit orders"),
+      ...(rows.length === 0
       ? ["No orders yet."]
-      : rows.map((r) => `${r.id.slice(0, 8)} [${r.status}${r.execution_status ? `/${r.execution_status}` : ""}] ${r.chain} ${r.side} ${r.identifier} ${r.direction} ${r.trigger_price} amt=${r.amount}${r.execution_error ? `\n  ${r.execution_error}` : ""}`);
+      : rows.map((r) =>
+          `${tradingStatus(r.execution_status ?? r.status)}  ${tradingSide(r.side)} · ${r.chain.toUpperCase()}\n` +
+          `🎯 ${triggerDirection(r.direction)} ${r.trigger_price}\n💰 Amount: ${r.amount}\n🪙 Asset: ${r.identifier}` +
+          `${r.execution_error ? `\n🔴 ${r.execution_error}` : ""}`
+        )),
+    ];
     const buttons = [
-      [Markup.button.callback("➕ New buy order", "order_new_buy"), Markup.button.callback("➕ New sell order", "order_new_sell")],
+      [Markup.button.callback("🟢 New buy order", "order_new_buy"), Markup.button.callback("🔴 New sell order", "order_new_sell")],
       ...rows
         .filter((r) => r.status === "open")
         .map((r) => [Markup.button.callback(`Cancel ${r.id.slice(0, 8)}`, `order_cancel_ask_${r.id}`)]),
@@ -1395,14 +1405,14 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
             : "";
           const expirySeconds = Math.max(0, Math.floor((quote.expiresAt - Date.now()) / 1000));
           await ctx.reply(
-            `TRADE PREVIEW · ${quote.chain.toUpperCase()} ${quote.side.toUpperCase()}\n\n` +
-              `${quote.side === "buy" ? "Spend" : "Sell"}: ${inputLabel}\n` +
-              `Token: ${asset}\n` +
-              `${quote.poolId ? `Pool: ${quote.poolId}\n` : ""}` +
-              `Expected output: ${expected} ${outputLabel}\n` +
-              `Minimum output: ${minimum} ${outputLabel}\n` +
-              `Maximum slippage: ${(quote.slippageBps / 100).toFixed(2)}%\n` +
-              `Quote expires in about ${expirySeconds} seconds.` +
+            `${tradingHeading(quote.side === "buy" ? "🟢" : "🔴", `${quote.side.toUpperCase()} · ${quote.chain}`)}\n` +
+              `💸 ${quote.side === "buy" ? "Spend" : "Sell"}: ${inputLabel}\n` +
+              `🪙 Token: ${asset}\n` +
+              `${quote.poolId ? `🏊 Pool: ${quote.poolId}\n` : ""}` +
+              `📈 Expected output: ${expected} ${outputLabel}\n` +
+              `🛡️ Minimum output: ${minimum} ${outputLabel}\n` +
+              `↔️ Maximum slippage: ${(quote.slippageBps / 100).toFixed(2)}%\n` +
+              `⏱ Quote expires in about ${expirySeconds} seconds.` +
               `${quote.chain === "evm" && quote.side === "buy" ? "\nRouter estimate may not include token transfer taxes." : ""}` +
               approvalNote +
               "\n\nThe swap will abort if its refreshed minimum output is below the minimum shown here.",
@@ -1773,16 +1783,16 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const wallets = listWalletsFor(db, userId);
     if (wallets.length === 0) return ctx.reply("No wallets yet.", walletsMenu);
 
-    const lines: string[] = [];
+    const lines: string[] = [tradingHeading("📊", "Portfolio"), "Live on-chain balances · no fiat valuation"];
     for (const w of wallets) {
-      const tag = w.is_primary ? " ⭐ primary" : "";
+      const tag = w.is_primary ? " ⭐ PRIMARY" : "";
       if (w.chain === "solana") {
         try {
           const p = await getSolanaPortfolio(solConnection, new PublicKey(w.address));
-          lines.push(`${w.label} — Solana (${w.address})${tag}:`, `  ${p.solBalance.toFixed(4)} SOL`);
-          p.tokens.forEach((t) => lines.push(`  ${t.uiAmount} — ${t.mint.slice(0, 8)}...`));
+          lines.push(`\n🔹 ${w.label} · SOLANA${tag}`, `📍 ${w.address}`, `🟢 ${p.solBalance.toFixed(4)} SOL`);
+          p.tokens.forEach((t) => lines.push(`🪙 ${t.uiAmount} · ${t.mint.slice(0, 8)}...`));
         } catch (err: any) {
-          lines.push(`${w.label} — Solana: couldn't fetch (${err.message})`);
+          lines.push(`\n🔹 ${w.label} · SOLANA`, `🔴 Balance unavailable: ${err.message}`);
         }
       } else {
         try {
@@ -1791,13 +1801,12 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           // as a best-effort reference on non-primary wallets too.
           const known = getHoldings(db, "evm", userId);
           const p = await getEvmPortfolio(evmProvider, w.address, known);
-          lines.push(`${w.label} — EVM (${w.address})${tag}:`, `  ${Number(p.ethBalance).toFixed(4)} ETH`);
-          p.tokens.forEach((t) => lines.push(`  ${Number(t.balance).toFixed(4)} ${t.symbol}`));
+          lines.push(`\n🔹 ${w.label} · EVM${tag}`, `📍 ${w.address}`, `🟢 ${Number(p.ethBalance).toFixed(4)} ETH`);
+          p.tokens.forEach((t) => lines.push(`🪙 ${Number(t.balance).toFixed(4)} ${t.symbol}`));
         } catch (err: any) {
-          lines.push(`${w.label} — EVM: couldn't fetch (${err.message})`);
+          lines.push(`\n🔹 ${w.label} · EVM`, `🔴 Balance unavailable: ${err.message}`);
         }
       }
-      lines.push("");
     }
 
     ctx.reply(lines.join("\n"), homeKeyboard(getUser(db, userId)?.role === "admin"));
