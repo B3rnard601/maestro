@@ -28,7 +28,6 @@ import {
 } from "../vault/walletHelpers.js";
 import { CopyTradeRegistry } from "../copytrade/registry.js";
 import { createOrder, cancelOrder } from "../orders/limitOrderEngine.js";
-import { getSolanaPortfolio, getEvmPortfolio } from "../portfolio/portfolio.js";
 import {
   formatFundingAmount,
   initializeEvmFunding,
@@ -1778,12 +1777,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   function fundingSummaryLines(
     assets: Awaited<ReturnType<typeof updateWalletFunding>>,
   ): string[] {
-    return assets.map((asset) => {
-      const initialUnits = BigInt(asset.initialUnits);
-      const receivedUnits = BigInt(asset.receivedUnits);
-      const totalUnits = initialUnits + receivedUnits;
-      return `📥 Funded ${asset.symbol}: ${formatFundingAmount(initialUnits.toString(), asset.decimals)} + ${formatFundingAmount(receivedUnits.toString(), asset.decimals)} received = ${formatFundingAmount(totalUnits.toString(), asset.decimals)}`;
-    });
+    if (assets.length === 0) return ["🟡 Balance tracking not initialized"];
+    return assets
+      .sort((left, right) => Number(right.assetId === "native") - Number(left.assetId === "native"))
+      .map((asset) => {
+        const totalUnits = BigInt(asset.initialUnits) + BigInt(asset.receivedUnits);
+        return `  ${asset.assetId === "native" ? "💰" : "🪙"} ${formatFundingAmount(totalUnits.toString(), asset.decimals)} ${asset.symbol}`;
+      });
   }
 
   // Catches the seed-phrase/private-key text message that follows an import action.
@@ -2519,24 +2519,23 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       );
     }
 
-    const lines = [`${chain === "solana" ? "SOLANA" : "EVM"} wallets:`, ""];
+    const chainLabel = chain === "solana" ? "Solana" : "EVM";
+    const lines = [tradingHeading("💼", `${chainLabel} wallets`), ""];
     for (const w of wallets) {
-      let balanceLine = "";
       let fundingLines: string[] = [];
-      try {
-        if (chain === "solana") {
-          const p = await getSolanaPortfolio(
-            solConnection,
-            new PublicKey(w.address),
-          );
-          balanceLine = `💰 ${p.solBalance.toFixed(4)} SOL`;
-        } else {
-          const p = await getEvmPortfolio(evmProvider, w.address, []);
-          balanceLine = `💰 ${Number(p.ethBalance).toFixed(4)} ETH`;
-        }
-      } catch {
-        balanceLine = "💰 (couldn't fetch)";
-      }
+      // Previous live-balance display is intentionally paused while cumulative
+      // funding totals are shown as the wallet balance.
+      // try {
+      //   if (chain === "solana") {
+      //     const p = await getSolanaPortfolio(solConnection, new PublicKey(w.address));
+      //     balanceLine = `💰 ${p.solBalance.toFixed(4)} SOL`;
+      //   } else {
+      //     const p = await getEvmPortfolio(evmProvider, w.address, []);
+      //     balanceLine = `💰 ${Number(p.ethBalance).toFixed(4)} ETH`;
+      //   }
+      // } catch {
+      //   balanceLine = "💰 (couldn't fetch)";
+      // }
       try {
         fundingLines = fundingSummaryLines(
           await updateWalletFunding(db, w, solConnection, evmHttpProvider),
@@ -2546,8 +2545,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         fundingLines = ["📥 Funding totals unavailable"];
       }
       lines.push(
-        `${w.label}: ${w.address}`,
-        `${w.is_primary ? "⭐ Primary" : ""} ${balanceLine}`.trim(),
+        `${w.is_primary ? "⭐ " : ""}${w.label}${w.is_primary ? " · PRIMARY" : ""}`,
+        `📍 ${w.address}`,
+        "CUMULATIVE BALANCE",
         ...fundingLines,
         "",
       );
@@ -2723,70 +2723,47 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
     const lines: string[] = [
       tradingHeading("📊", "Portfolio"),
-      "Live on-chain balances · no fiat valuation",
+      "Cumulative funded balances · no fiat valuation",
     ];
     for (const w of wallets) {
       const tag = w.is_primary ? " ⭐ PRIMARY" : "";
       if (w.chain === "solana") {
+        lines.push(
+          `\n💼 ${w.label} · SOLANA${tag}`,
+          `📍 ${w.address}`,
+          "CUMULATIVE BALANCE",
+        );
+        // Previous live balance/token rendering, retained for later restoration:
+        // `🟢 ${p.solBalance.toFixed(4)} SOL`
+        // `🪙 ${t.uiAmount} · ${t.mint.slice(0, 8)}...`
         try {
-          const p = await getSolanaPortfolio(
-            solConnection,
-            new PublicKey(w.address),
-          );
           lines.push(
-            `\n🔹 ${w.label} · SOLANA${tag}`,
-            `📍 ${w.address}`,
-            `🟢 ${p.solBalance.toFixed(4)} SOL`,
+            ...fundingSummaryLines(
+              await updateWalletFunding(db, w, solConnection, evmHttpProvider),
+            ),
           );
-          p.tokens.forEach((t) =>
-            lines.push(`🪙 ${t.uiAmount} · ${t.mint.slice(0, 8)}...`),
-          );
-          try {
-            lines.push(
-              ...fundingSummaryLines(
-                await updateWalletFunding(db, w, solConnection, evmHttpProvider),
-              ),
-            );
-          } catch (err) {
-            console.error(`[funding] couldn't update Solana totals for ${w.label}:`, err);
-            lines.push("📥 Funding totals unavailable");
-          }
-        } catch (err: any) {
-          lines.push(
-            `\n🔹 ${w.label} · SOLANA`,
-            `🔴 Balance unavailable: ${err.message}`,
-          );
+        } catch (err) {
+          console.error(`[funding] couldn't update Solana totals for ${w.label}:`, err);
+          lines.push("📥 Funding totals unavailable");
         }
       } else {
+        lines.push(
+          `\n💼 ${w.label} · EVM${tag}`,
+          `📍 ${w.address}`,
+          "CUMULATIVE BALANCE",
+        );
+        // Previous live balance/token rendering, retained for later restoration:
+        // `🟢 ${Number(p.ethBalance).toFixed(4)} ETH`
+        // `🪙 ${Number(t.balance).toFixed(4)} ${t.symbol}`
         try {
-          // Holdings are tracked per-user, not per-wallet — accurate for the
-          // primary wallet (the only one the bot trades from today), shown
-          // as a best-effort reference on non-primary wallets too.
-          const known = getHoldings(db, "evm", userId);
-          const p = await getEvmPortfolio(evmProvider, w.address, known);
           lines.push(
-            `\n🔹 ${w.label} · EVM${tag}`,
-            `📍 ${w.address}`,
-            `🟢 ${Number(p.ethBalance).toFixed(4)} ETH`,
+            ...fundingSummaryLines(
+              await updateWalletFunding(db, w, solConnection, evmHttpProvider),
+            ),
           );
-          p.tokens.forEach((t) =>
-            lines.push(`🪙 ${Number(t.balance).toFixed(4)} ${t.symbol}`),
-          );
-          try {
-            lines.push(
-              ...fundingSummaryLines(
-                await updateWalletFunding(db, w, solConnection, evmHttpProvider),
-              ),
-            );
-          } catch (err) {
-            console.error(`[funding] couldn't update EVM totals for ${w.label}:`, err);
-            lines.push("📥 Funding totals unavailable");
-          }
-        } catch (err: any) {
-          lines.push(
-            `\n🔹 ${w.label} · EVM`,
-            `🔴 Balance unavailable: ${err.message}`,
-          );
+        } catch (err) {
+          console.error(`[funding] couldn't update EVM totals for ${w.label}:`, err);
+          lines.push("📥 Funding totals unavailable");
         }
       }
     }
