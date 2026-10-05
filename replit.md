@@ -15,6 +15,9 @@ Install dependencies at the repository root, in `admin-server/`, and in
 
 ## Development services
 
+The Run button starts the `Project` workflow, which runs all three services
+in parallel. Each service can also be started or stopped independently.
+
 - Admin web: `npm --prefix admin-web run dev`, on `0.0.0.0:5000`.
   Vite forwards `/api` to the admin API on port 4000. Leave `VITE_API_URL`
   unset so browser requests use the same origin.
