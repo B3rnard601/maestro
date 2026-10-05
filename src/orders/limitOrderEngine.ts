@@ -4,13 +4,11 @@ import { Connection, Keypair } from "@solana/web3.js";
 import { JsonRpcProvider, Wallet as EvmWallet } from "ethers";
 import { getSolanaPrice } from "../chains/solana/price.js";
 import { getEvmPrice } from "../chains/evm/price.js";
-import { executeBuy as executeSolanaBuy, executeSell as executeSolanaSell } from "../chains/solana/executor.js";
-import { executeBuy as executeEvmBuy, executeSell as executeEvmSell } from "../chains/evm/executor.js";
-import { getSystemControls, recordHolding } from "../db/db.js";
+import { getSystemControls, getTradeJobByDedupeKey } from "../db/db.js";
 import type { AppConfig } from "../config/env.js";
-import { assertBuyEntryEnabled, evaluateTradePolicy } from "../risk/policy.js";
+import { evaluateTradePolicy } from "../risk/policy.js";
 import { parseUnitsExact } from "../shared/amount.js";
-import { beginTrackedTrade } from "../transactions/tracker.js";
+import { enqueueAutomatedTrade } from "../transactions/worker.js";
 
 export interface LimitOrderInput {
   userId: string;
@@ -66,7 +64,19 @@ export function createOrder(db: Database.Database, order: LimitOrderInput): stri
 }
 
 export function cancelOrder(db: Database.Database, id: string) {
-  db.prepare(`UPDATE limit_orders SET status = 'cancelled' WHERE id = ? AND status = 'open'`).run(id);
+  const cancel = db.transaction(() => {
+    const job = db.prepare(`SELECT id, status FROM trade_jobs WHERE dedupe_key = ?`)
+      .get(`limit_order:${id}`) as { id: string; status: string } | undefined;
+    if (job && ["processing", "submitted", "completed"].includes(job.status)) return false;
+    const result = db.prepare(`UPDATE limit_orders SET status = 'cancelled' WHERE id = ? AND status = 'open'`).run(id);
+    if (result.changes !== 1) return false;
+    if (job?.status === "queued") {
+      db.prepare(`UPDATE trade_jobs SET status = 'failed', last_error = 'Limit order cancelled before execution.', updated_at = ? WHERE id = ?`)
+        .run(Date.now(), job.id);
+    }
+    return true;
+  });
+  return cancel();
 }
 
 function getOpenOrders(db: Database.Database) {
@@ -79,10 +89,6 @@ function markFilled(db: Database.Database, id: string) {
 
 function crossed(direction: "above" | "below", price: number, trigger: number): boolean {
   return direction === "above" ? price >= trigger : price <= trigger;
-}
-
-function toBaseUnits(amount: string, decimals: number): bigint {
-  return parseUnitsExact(amount, decimals);
 }
 
 export interface EngineDeps {
@@ -109,13 +115,13 @@ export function startLimitOrderEngine(deps: EngineDeps) {
   const { db, solConnection, loadSolWallet, evmProvider, loadEvmWallet, evmFactoryAddress, config } = deps;
   const pollIntervalMs = deps.pollIntervalMs ?? 5_000;
   const auditedBlockedOrders = new Set<string>();
+  const warnedFailedJobs = new Set<string>();
 
   const interval = setInterval(async () => {
     const orders = getOpenOrders(db);
     if (orders.length === 0) return;
 
     for (const order of orders) {
-      let lifecycle: ReturnType<typeof beginTrackedTrade> | undefined;
       try {
         const amount = order.amount_exact ?? String(order.amount);
         const solWallet = order.chain === "solana" ? loadSolWallet(order.user_id) : null;
@@ -155,64 +161,32 @@ export function startLimitOrderEngine(deps: EngineDeps) {
           auditedBlockedOrders.add(order.id);
           continue;
         }
-        lifecycle = beginTrackedTrade(db, {
+
+        const dedupeKey = `limit_order:${order.id}`;
+        const existingJob = getTradeJobByDedupeKey(db, dedupeKey);
+        if (existingJob) {
+          if (existingJob.status === "completed") markFilled(db, order.id);
+          if (existingJob.status === "failed" && !warnedFailedJobs.has(existingJob.id)) {
+            warnedFailedJobs.add(existingJob.id);
+            console.warn(`[limit-order] ${order.id} has a failed execution job ${existingJob.id}; cancel or replace the order to retry.`);
+          }
+          continue;
+        }
+
+        const job = enqueueAutomatedTrade(db, {
+          dedupeKey,
           userId: order.user_id,
           chain: order.chain,
           side: order.side,
           source: "limit_order",
           asset: order.identifier,
           amount,
+          poolRef: order.pool_ref ?? undefined,
+          decimals: order.decimals ?? undefined,
+          limitOrderId: order.id,
         });
-
-        if (order.chain === "solana") {
-          if (order.side === "buy") {
-            await executeSolanaBuy({
-              connection: solConnection,
-              wallet: solWallet!,
-              poolId: order.pool_ref,
-              amountInLamports: parseUnitsExact(amount, 9),
-              slippageBps: decision.maxSlippageBps,
-              assertCanSubmit: () => assertBuyEntryEnabled(db, order.user_id, "solana", "limit_order"),
-              onLifecycleEvent: lifecycle.observe,
-            });
-          } else {
-            await executeSolanaSell({
-              connection: solConnection,
-              wallet: solWallet!,
-              poolId: order.pool_ref,
-              amountInTokenBaseUnits: toBaseUnits(amount, order.decimals),
-              slippageBps: decision.maxSlippageBps,
-              onLifecycleEvent: lifecycle.observe,
-            });
-          }
-        } else {
-          if (order.side === "buy") {
-            await executeEvmBuy({
-              provider: evmProvider,
-              wallet: evmWallet!,
-              tokenAddress: order.identifier,
-              amountInEth: amount,
-              slippageBps: decision.maxSlippageBps,
-              assertCanSubmit: () => assertBuyEntryEnabled(db, order.user_id, "evm", "limit_order"),
-              onLifecycleEvent: lifecycle.observe,
-            });
-            recordHolding(db, "evm", order.user_id, order.identifier);
-          } else {
-            await executeEvmSell({
-              provider: evmProvider,
-              wallet: evmWallet!,
-              tokenAddress: order.identifier,
-              amountInTokenBaseUnits: toBaseUnits(amount, order.decimals),
-              slippageBps: decision.maxSlippageBps,
-              onLifecycleEvent: lifecycle.observe,
-            });
-          }
-        }
-
-        markFilled(db, order.id);
+        console.info(`[limit-order] queued triggered order ${order.id} as job ${job.id}`);
       } catch (err) {
-        lifecycle?.failIfNotSubmitted(err);
-        if (lifecycle?.wasSubmitted) markFilled(db, order.id);
         console.error(`[limit-order] error processing order ${order.id}:`, err);
       }
     }

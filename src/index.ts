@@ -9,20 +9,18 @@ import { getSolanaConnection } from "./chains/solana/connection.js";
 import { startPoolListener } from "./chains/solana/poolListener.js";
 import { extractRaydiumPoolKeysFromTx, getPoolIdByMint } from "./chains/solana/poolKeys.js";
 import { getRaydium } from "./chains/solana/raydiumClient.js";
-import { executeBuy as executeSolanaBuy } from "./chains/solana/executor.js";
 import { runSolanaSafetyChecks } from "./chains/solana/safetyChecks.js";
 import { getEvmWsProvider, getEvmHttpProvider } from "./chains/evm/provider.js";
 import { startPairListener } from "./chains/evm/pairListener.js";
 import { runEvmSafetyChecks } from "./chains/evm/safetyChecks.js";
-import { executeBuy as executeEvmBuy } from "./chains/evm/executor.js";
 import { CopyTradeRegistry } from "./copytrade/registry.js";
 import { scaleTrade } from "./copytrade/engine.js";
-import { openDb, recordHolding, listActiveSnipers } from "./db/db.js";
+import { openDb, listActiveSnipers } from "./db/db.js";
 import { startLimitOrderEngine } from "./orders/limitOrderEngine.js";
-import { assertBuyEntryEnabled, evaluateTradePolicy } from "./risk/policy.js";
-import { formatUnitsExact, parseUnitsExact } from "./shared/amount.js";
-import { beginTrackedTrade } from "./transactions/tracker.js";
+import { evaluateTradePolicy } from "./risk/policy.js";
+import { formatUnitsExact } from "./shared/amount.js";
 import { startTradeReconciler } from "./transactions/reconciler.js";
+import { enqueueAutomatedTrade, startTradeWorker } from "./transactions/worker.js";
 
 /**
  * Many ISPs hand out IPv6 addresses that don't route well internationally.
@@ -87,23 +85,17 @@ async function main() {
           source: "sniper",
         });
         if (!decision.allowed) continue;
-        const lifecycle = beginTrackedTrade(db, {
+        const job = enqueueAutomatedTrade(db, {
+          dedupeKey: `sniper:solana:${event.signature}:${user.telegram_id}`,
           userId: user.telegram_id,
           chain: "solana",
           side: "buy",
           source: "sniper",
           asset: mint,
           amount,
+          poolRef: keys.poolId,
         });
-        await executeSolanaBuy({
-          connection: solConn,
-          wallet,
-          poolId: keys.poolId,
-          amountInLamports: parseUnitsExact(amount, 9),
-          slippageBps: decision.maxSlippageBps,
-          assertCanSubmit: () => assertBuyEntryEnabled(db, user.telegram_id, "solana", "sniper"),
-          onLifecycleEvent: lifecycle.observe,
-        });
+        console.info(`[queue] sniping entry queued: ${job.id} user=${user.telegram_id} mint=${mint}`);
       } catch (err) {
         console.error(`[SOL] snipe buy failed for user ${user.telegram_id}:`, err);
       }
@@ -133,24 +125,17 @@ async function main() {
           source: "sniper",
         });
         if (!decision.allowed) continue;
-        const lifecycle = beginTrackedTrade(db, {
+        const job = enqueueAutomatedTrade(db, {
+          dedupeKey: `sniper:evm:${event.pair}:${user.telegram_id}`,
           userId: user.telegram_id,
           chain: "evm",
           side: "buy",
           source: "sniper",
           asset: newToken,
           amount,
+          poolRef: event.pair,
         });
-        await executeEvmBuy({
-          provider: evmHttp,
-          wallet,
-          tokenAddress: newToken,
-          amountInEth: amount,
-          slippageBps: decision.maxSlippageBps,
-          assertCanSubmit: () => assertBuyEntryEnabled(db, user.telegram_id, "evm", "sniper"),
-          onLifecycleEvent: lifecycle.observe,
-        });
-        recordHolding(db, "evm", user.telegram_id, newToken);
+        console.info(`[queue] sniping entry queued: ${job.id} user=${user.telegram_id} token=${newToken}`);
       } catch (err) {
         console.error(`[EVM] snipe buy failed for user ${user.telegram_id}:`, err);
       }
@@ -195,23 +180,17 @@ async function main() {
           const raydium = await getRaydium(solConn, wallet);
           const poolId = await getPoolIdByMint(raydium, scaled.identifier);
           if (!poolId) continue;
-          const lifecycle = beginTrackedTrade(db, {
+          const job = enqueueAutomatedTrade(db, {
+            dedupeKey: `copytrade:solana:${trade.signature}:${user.telegram_id}`,
             userId: user.telegram_id,
             chain: "solana",
             side: "buy",
             source: "copytrade",
             asset: scaled.identifier,
             amount: scaled.amount,
+            poolRef: poolId,
           });
-          await executeSolanaBuy({
-            connection: solConn,
-            wallet,
-            poolId,
-            amountInLamports: parseUnitsExact(scaled.amount, 9),
-            slippageBps: decision.maxSlippageBps,
-            assertCanSubmit: () => assertBuyEntryEnabled(db, user.telegram_id, "solana", "copytrade"),
-            onLifecycleEvent: lifecycle.observe,
-          });
+          console.info(`[queue] copy entry queued: ${job.id} user=${user.telegram_id} mint=${scaled.identifier}`);
         } catch (err) {
           console.error(`[copytrade/sol] buy failed for user ${user.telegram_id}:`, err);
         }
@@ -248,24 +227,17 @@ async function main() {
           if (!decision.allowed) continue;
           const result = await runEvmSafetyChecks(evmHttp, scaled.identifier, simWallet);
           if (!result.safe) continue;
-          const lifecycle = beginTrackedTrade(db, {
+          const job = enqueueAutomatedTrade(db, {
+            dedupeKey: `copytrade:evm:${trade.txHash}:${user.telegram_id}`,
             userId: user.telegram_id,
             chain: "evm",
             side: "buy",
             source: "copytrade",
             asset: scaled.identifier,
             amount: scaled.amount,
+            poolRef: undefined,
           });
-          await executeEvmBuy({
-            provider: evmHttp,
-            wallet,
-            tokenAddress: scaled.identifier,
-            amountInEth: scaled.amount,
-            slippageBps: decision.maxSlippageBps,
-            assertCanSubmit: () => assertBuyEntryEnabled(db, user.telegram_id, "evm", "copytrade"),
-            onLifecycleEvent: lifecycle.observe,
-          });
-          recordHolding(db, "evm", user.telegram_id, scaled.identifier);
+          console.info(`[queue] copy entry queued: ${job.id} user=${user.telegram_id} token=${scaled.identifier}`);
         } catch (err) {
           console.error(`[copytrade/evm] buy failed for user ${user.telegram_id}:`, err);
         }
@@ -283,6 +255,15 @@ async function main() {
     loadEvmWallet: (userId) => getPrimaryEvmWallet(vault, db, userId),
     evmFactoryAddress: config.uniswapV2Factory,
     config,
+  });
+
+  startTradeWorker({
+    db,
+    config,
+    solConnection: solConn,
+    evmProvider: evmHttp,
+    loadSolWallet: (userId) => getPrimarySolanaKeypair(vault, db, userId),
+    loadEvmWallet: (userId) => getPrimaryEvmWallet(vault, db, userId),
   });
 
   // --- Telegram control surface ---

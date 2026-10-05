@@ -37,6 +37,7 @@ import {
   recordHolding,
   recordSecurityEvent,
   listRecentTradesForUser,
+  listRecentTradeJobsForUser,
 } from "../db/db.js";
 import { executeBuy as executeSolanaBuy, executeSell as executeSolanaSell, quoteBuy as quoteSolanaBuy, quoteSell as quoteSolanaSell } from "../chains/solana/executor.js";
 import { executeBuy as executeEvmBuy, executeSell as executeEvmSell, quoteBuy as quoteEvmBuy, quoteSell as quoteEvmSell } from "../chains/evm/executor.js";
@@ -390,15 +391,24 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   bot.action("home_trades", async (ctx) => {
     await ctx.answerCbQuery();
     const trades = listRecentTradesForUser(db, String(ctx.from!.id), 10);
-    const text = trades.length === 0
-      ? "No tracked trades yet."
-      : trades.map((trade) => {
+    const jobs = listRecentTradeJobsForUser(db, String(ctx.from!.id), 10);
+    const lifecycleText = trades.map((trade) => {
           const date = new Date(trade.created_at).toISOString().replace("T", " ").slice(0, 19);
           const ref = trade.transaction_ref ?? trade.approval_transaction_ref;
           const error = trade.error ? `\n  Note: ${trade.error}` : "";
           return `${date} · ${trade.chain.toUpperCase()} ${trade.side.toUpperCase()} ${trade.amount} · ${trade.source} · ${trade.status.toUpperCase()}` +
             `${ref ? `\n  Tx: ${ref}` : ""}${trade.bundle_ref ? `\n  Bundle: ${trade.bundle_ref}` : ""}${error}`;
-        }).join("\n\n");
+        });
+    const jobText = jobs
+      .filter((job) => !job.lifecycle_id || !trades.some((trade) => trade.id === job.lifecycle_id))
+      .map((job) => {
+        const date = new Date(job.created_at).toISOString().replace("T", " ").slice(0, 19);
+        const error = job.last_error ? `\n  Note: ${job.last_error}` : "";
+        return `${date} · ${job.chain.toUpperCase()} ${job.side.toUpperCase()} ${job.amount} · ${job.source} · QUEUE ${job.status.toUpperCase()} (${job.attempts}/${job.max_attempts})${error}`;
+      });
+    const text = [...jobText, ...lifecycleText].length === 0
+      ? "No tracked trades yet."
+      : [...jobText, ...lifecycleText].join("\n\n");
     await ctx.reply(
       `RECENT TRADES\n\n${text}\n\nUnknown means the RPC did not provide a final status in time; reconciliation continues.`,
       Markup.inlineKeyboard([
@@ -656,11 +666,15 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   async function showOrders(ctx: any) {
     const rows = db
-      .prepare(`SELECT id, chain, identifier, side, direction, trigger_price, COALESCE(amount_exact, CAST(amount AS TEXT)) AS amount, status FROM limit_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`)
+      .prepare(`SELECT o.id, o.chain, o.identifier, o.side, o.direction, o.trigger_price,
+        COALESCE(o.amount_exact, CAST(o.amount AS TEXT)) AS amount, o.status,
+        j.status AS execution_status, j.last_error AS execution_error
+        FROM limit_orders o LEFT JOIN trade_jobs j ON j.dedupe_key = 'limit_order:' || o.id
+        WHERE o.user_id = ? ORDER BY o.created_at DESC LIMIT 20`)
       .all(String(ctx.from!.id)) as any[];
     const lines = rows.length === 0
       ? ["No orders yet."]
-      : rows.map((r) => `${r.id.slice(0, 8)} [${r.status}] ${r.chain} ${r.side} ${r.identifier} ${r.direction} ${r.trigger_price} amt=${r.amount}`);
+      : rows.map((r) => `${r.id.slice(0, 8)} [${r.status}${r.execution_status ? `/${r.execution_status}` : ""}] ${r.chain} ${r.side} ${r.identifier} ${r.direction} ${r.trigger_price} amt=${r.amount}${r.execution_error ? `\n  ${r.execution_error}` : ""}`);
     const buttons = [
       [Markup.button.callback("➕ New buy order", "order_new_buy"), Markup.button.callback("➕ New sell order", "order_new_sell")],
       ...rows
@@ -748,7 +762,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       .prepare(`SELECT id, status FROM limit_orders WHERE id = ? AND user_id = ?`)
       .get(orderId, String(ctx.from!.id)) as { id: string; status: string } | undefined;
     if (!row || row.status !== "open") return ctx.reply("That order is no longer open.");
-    cancelOrder(db, row.id);
+    if (!cancelOrder(db, row.id)) return ctx.reply("That order is already executing or its status changed; refresh the order list.");
     await ctx.reply(`Cancelled order ${row.id.slice(0, 8)}.`);
     await showOrders(ctx);
   });
@@ -1634,7 +1648,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     if (!idPrefix) return ctx.reply("Usage: /cancel <orderId>");
     const row = db.prepare(`SELECT id FROM limit_orders WHERE id LIKE ? AND user_id = ?`).get(`${idPrefix}%`, String(ctx.from!.id)) as any;
     if (!row) return ctx.reply("No matching order.");
-    cancelOrder(db, row.id);
+    if (!cancelOrder(db, row.id)) return ctx.reply("That order is already executing or its status changed; refresh the order list.");
     ctx.reply(`Cancelled ${row.id}.`);
   });
 

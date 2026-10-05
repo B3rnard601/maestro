@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { formatUnitsExact, numberToDecimalString, parseUnitsFloor } from "../shared/amount.js";
 
 export function openDb(filePath = "./data/bot.db"): Database.Database {
@@ -116,10 +117,35 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       updated_at INTEGER NOT NULL,
       confirmed_at INTEGER
     );
+    CREATE TABLE IF NOT EXISTS trade_jobs (
+      id TEXT PRIMARY KEY,
+      dedupe_key TEXT NOT NULL UNIQUE,
+      user_id TEXT NOT NULL,
+      chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
+      side TEXT NOT NULL CHECK(side IN ('buy','sell')),
+      source TEXT NOT NULL CHECK(source IN ('sniper','copytrade','limit_order')),
+      asset TEXT NOT NULL,
+      amount TEXT NOT NULL,
+      pool_ref TEXT,
+      decimals INTEGER,
+      limit_order_id TEXT,
+      status TEXT NOT NULL CHECK(status IN ('queued','processing','submitted','completed','failed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 5,
+      available_at INTEGER NOT NULL,
+      lifecycle_id TEXT,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS trade_lifecycle_user_recent
       ON trade_lifecycle(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS trade_lifecycle_pending
       ON trade_lifecycle(status, updated_at);
+    CREATE INDEX IF NOT EXISTS trade_jobs_ready
+      ON trade_jobs(status, available_at, created_at);
+    CREATE INDEX IF NOT EXISTS trade_jobs_user_recent
+      ON trade_jobs(user_id, created_at DESC);
   `);
   db.prepare(`INSERT OR IGNORE INTO system_controls (id, kill_switch_enabled, updated_at, updated_by) VALUES (1, 0, ?, NULL)`)
     .run(Date.now());
@@ -182,6 +208,7 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
   ensureColumn("users", "snipe_size_eth_exact", "TEXT NOT NULL DEFAULT '0.05'");
   ensureColumn("users", "copy_size_ratio_exact", "TEXT NOT NULL DEFAULT '0.1'");
   ensureColumn("users", "copy_max_amount_exact", "TEXT NOT NULL DEFAULT '0.2'");
+  ensureColumn("trade_lifecycle", "job_id", "TEXT");
   const legacyUsers = db.prepare(`SELECT telegram_id, snipe_size_sol, snipe_size_sol_exact, snipe_size_eth, snipe_size_eth_exact,
     copy_size_ratio, copy_size_ratio_exact, copy_max_amount, copy_max_amount_exact FROM users`).all() as Array<{
       telegram_id: string;
@@ -514,6 +541,184 @@ export interface TradeLifecycleInput {
   amount: string;
 }
 
+export interface TradeJobInput {
+  dedupeKey: string;
+  userId: string;
+  chain: "solana" | "evm";
+  side: "buy" | "sell";
+  source: "sniper" | "copytrade" | "limit_order";
+  asset: string;
+  amount: string;
+  poolRef?: string;
+  decimals?: number;
+  limitOrderId?: string;
+}
+
+export interface TradeJobRow {
+  id: string;
+  dedupe_key: string;
+  user_id: string;
+  chain: "solana" | "evm";
+  side: "buy" | "sell";
+  source: "sniper" | "copytrade" | "limit_order";
+  asset: string;
+  amount: string;
+  pool_ref: string | null;
+  decimals: number | null;
+  limit_order_id: string | null;
+  status: "queued" | "processing" | "submitted" | "completed" | "failed";
+  attempts: number;
+  max_attempts: number;
+  available_at: number;
+  lifecycle_id: string | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export function enqueueTradeJob(db: Database.Database, job: TradeJobInput): TradeJobRow {
+  const now = Date.now();
+  const id = randomUUID();
+  db.prepare(`INSERT OR IGNORE INTO trade_jobs
+    (id, dedupe_key, user_id, chain, side, source, asset, amount, pool_ref, decimals, limit_order_id,
+      status, available_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`).run(
+    id,
+    job.dedupeKey,
+    job.userId,
+    job.chain,
+    job.side,
+    job.source,
+    job.asset,
+    job.amount,
+    job.poolRef ?? null,
+    job.decimals ?? null,
+    job.limitOrderId ?? null,
+    now,
+    now,
+    now
+  );
+  const row = db.prepare(`SELECT * FROM trade_jobs WHERE dedupe_key = ?`).get(job.dedupeKey) as TradeJobRow | undefined;
+  if (!row) throw new Error("Failed to persist trade job.");
+  return row;
+}
+
+export function claimNextTradeJob(db: Database.Database): TradeJobRow | null {
+  const claim = db.transaction(() => {
+    const job = db.prepare(`SELECT * FROM trade_jobs WHERE status = 'queued' AND available_at <= ?
+      ORDER BY created_at ASC LIMIT 1`).get(Date.now()) as TradeJobRow | undefined;
+    if (!job) return null;
+    const result = db.prepare(`UPDATE trade_jobs SET status = 'processing', attempts = attempts + 1, updated_at = ?
+      WHERE id = ? AND status = 'queued'`).run(Date.now(), job.id);
+    if (result.changes !== 1) return null;
+    return db.prepare(`SELECT * FROM trade_jobs WHERE id = ?`).get(job.id) as TradeJobRow;
+  });
+  return claim();
+}
+
+export function attachLifecycleToTradeJob(db: Database.Database, jobId: string, lifecycleId: string): void {
+  const attach = db.transaction(() => {
+    db.prepare(`UPDATE trade_lifecycle SET job_id = NULL WHERE job_id = ?`).run(jobId);
+    const result = db.prepare(`UPDATE trade_jobs SET lifecycle_id = ?, updated_at = ? WHERE id = ?`)
+      .run(lifecycleId, Date.now(), jobId);
+    if (result.changes !== 1) throw new Error(`Trade job ${jobId} is missing.`);
+    db.prepare(`UPDATE trade_lifecycle SET job_id = ? WHERE id = ?`).run(jobId, lifecycleId);
+  });
+  attach();
+}
+
+export function setTradeJobStatus(
+  db: Database.Database,
+  id: string,
+  status: TradeJobRow["status"],
+  options: { error?: string; retryAt?: number } = {}
+): void {
+  const now = Date.now();
+  const result = db.prepare(`UPDATE trade_jobs SET status = ?, last_error = ?,
+      available_at = COALESCE(?, available_at), updated_at = ? WHERE id = ?`)
+    .run(status, options.error?.slice(0, 500) ?? null, options.retryAt ?? null, now, id);
+  if (result.changes !== 1) throw new Error(`Trade job ${id} is missing.`);
+}
+
+export function deferTradeJob(db: Database.Database, id: string, retryAt: number, reason: string): void {
+  db.prepare(`UPDATE trade_jobs SET status = 'queued', attempts = MAX(0, attempts - 1),
+      available_at = ?, last_error = ?, updated_at = ? WHERE id = ?`)
+    .run(retryAt, reason.slice(0, 500), Date.now(), id);
+}
+
+export function getTradeJobByDedupeKey(db: Database.Database, dedupeKey: string): TradeJobRow | null {
+  return (db.prepare(`SELECT * FROM trade_jobs WHERE dedupe_key = ?`).get(dedupeKey) as TradeJobRow) ?? null;
+}
+
+export function listRecentTradeJobsForUser(db: Database.Database, userId: string, limit = 10): TradeJobRow[] {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new RangeError("Trade job history limit must be from 1 to 50.");
+  return db.prepare(`SELECT * FROM trade_jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?`)
+    .all(userId, limit) as TradeJobRow[];
+}
+
+export function recoverProcessingTradeJobs(db: Database.Database): void {
+  const now = Date.now();
+  const recover = db.transaction(() => {
+    db.prepare(`UPDATE trade_jobs SET status = 'queued', available_at = ?, last_error = 'Worker restarted before submission; retrying.',
+        updated_at = ? WHERE status = 'processing' AND lifecycle_id IS NULL AND attempts < max_attempts`)
+      .run(now, now);
+    db.prepare(`UPDATE trade_jobs SET status = 'failed', last_error = 'Worker restarted and retry limit was reached.',
+        updated_at = ? WHERE status = 'processing' AND lifecycle_id IS NULL AND attempts >= max_attempts`)
+      .run(now);
+    db.prepare(`UPDATE trade_jobs SET status = 'completed', updated_at = ?, last_error = NULL
+        WHERE status = 'processing' AND lifecycle_id IN (SELECT id FROM trade_lifecycle WHERE status = 'confirmed')`)
+      .run(now);
+    db.prepare(`UPDATE limit_orders SET status = 'filled', filled_at = ?
+        WHERE status = 'open' AND id IN (SELECT limit_order_id FROM trade_jobs
+          WHERE status = 'completed' AND limit_order_id IS NOT NULL)`)
+      .run(now);
+    db.prepare(`UPDATE trade_jobs SET status = 'failed', last_error = 'Worker restarted after the trade failed.',
+        updated_at = ? WHERE status = 'processing' AND lifecycle_id IN (SELECT id FROM trade_lifecycle WHERE status = 'failed')`)
+      .run(now);
+    db.prepare(`UPDATE trade_jobs SET status = 'submitted', last_error = 'Submission status is being reconciled.',
+        updated_at = ? WHERE status = 'processing' AND lifecycle_id IN
+          (SELECT id FROM trade_lifecycle WHERE status IN ('submitted','unknown'))`)
+      .run(now);
+
+    const prepared = db.prepare(`SELECT id FROM trade_jobs
+      WHERE status = 'processing' AND lifecycle_id IN (SELECT id FROM trade_lifecycle WHERE status = 'prepared')`)
+      .all() as { id: string }[];
+    for (const { id } of prepared) {
+      const job = db.prepare(`SELECT lifecycle_id, attempts, max_attempts FROM trade_jobs WHERE id = ?`)
+        .get(id) as { lifecycle_id: string; attempts: number; max_attempts: number };
+      db.prepare(`UPDATE trade_lifecycle SET job_id = NULL, status = 'failed',
+          error = 'Worker restarted before transaction submission.', updated_at = ? WHERE id = ? AND status = 'prepared'`)
+        .run(now, job.lifecycle_id);
+      if (job.attempts < job.max_attempts) {
+        db.prepare(`UPDATE trade_jobs SET status = 'queued', lifecycle_id = NULL, available_at = ?,
+            last_error = 'Worker restarted before transaction submission; retrying.', updated_at = ? WHERE id = ?`)
+          .run(now, now, id);
+      } else {
+        db.prepare(`UPDATE trade_jobs SET status = 'failed', last_error = 'Worker restarted and retry limit was reached.',
+            updated_at = ? WHERE id = ?`)
+          .run(now, id);
+      }
+    }
+  });
+  recover();
+}
+
+export function syncTradeJobWithLifecycle(db: Database.Database, lifecycleId: string, status: "confirmed" | "failed" | "unknown", error?: string): void {
+  const lifecycle = db.prepare(`SELECT job_id FROM trade_lifecycle WHERE id = ?`).get(lifecycleId) as { job_id: string | null } | undefined;
+  if (lifecycle?.job_id) {
+    const jobStatus = status === "confirmed" ? "completed" : status === "failed" ? "failed" : "submitted";
+    const job = db.prepare(`SELECT limit_order_id FROM trade_jobs WHERE id = ?`).get(lifecycle.job_id) as { limit_order_id: string | null } | undefined;
+    const transaction = db.transaction(() => {
+      setTradeJobStatus(db, lifecycle.job_id!, jobStatus, { error });
+      if (status === "confirmed" && job?.limit_order_id) {
+        db.prepare(`UPDATE limit_orders SET status = 'filled', filled_at = ? WHERE id = ? AND status = 'open'`)
+          .run(Date.now(), job.limit_order_id);
+      }
+    });
+    transaction();
+  }
+}
+
 export interface TradeLifecycleRow {
   id: string;
   user_id: string;
@@ -584,6 +789,7 @@ export function updateTradeLifecycle(
     const existing = db.prepare(`SELECT status FROM trade_lifecycle WHERE id = ?`).get(id) as { status: string } | undefined;
     if (!existing) throw new Error(`Trade lifecycle ${id} is missing.`);
   }
+  syncTradeJobWithLifecycle(db, id, status, error);
 }
 
 export function listRecentTradesForUser(db: Database.Database, userId: string, limit = 10): TradeLifecycleRow[] {

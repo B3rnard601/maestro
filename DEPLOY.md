@@ -27,6 +27,7 @@ Fill in `.env`:
 - `MAX_SLIPPAGE_BPS` — slippage used for swaps, from 1 to 500 basis points (default `500`).
 - `TRADE_QUOTE_TTL_SECONDS` — expiry for button-driven manual trade previews (10–300 seconds, default `60`). Confirmation is one-use and rechecks the minimum output before signing.
 - Trade lifecycle records are stored in the bot SQLite database. EVM receipts and Solana finalized signatures are reconciled in the background; trades without a final status after 15 minutes are marked `unknown` and continue to be checked. Use **Recent trades** in Telegram to inspect tracked executions.
+- Automated trades and triggered limit orders are persisted in a SQLite queue and processed serially. Retryable failures use bounded exponential backoff (up to five attempts); once a transaction submission may have happened, the worker does not resubmit it and leaves the lifecycle reconciler to determine the result. Buy jobs wait while the admin kill switch is active.
 - `VAULT_MASTER_KEY` — generate one, don't reuse across environments:
 
 ```bash
