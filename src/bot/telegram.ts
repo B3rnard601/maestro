@@ -1,10 +1,21 @@
 import { Telegraf, Markup } from "telegraf";
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
-import { isNonNegativeDecimal, isPositiveDecimal, parseUnitsExact } from "../shared/amount.js";
+import {
+  isNonNegativeDecimal,
+  isPositiveDecimal,
+  parseUnitsExact,
+} from "../shared/amount.js";
 import type { AppConfig } from "../config/env.js";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
-import { Contract, formatUnits, getAddress, isAddress, JsonRpcProvider, Provider } from "ethers";
+import {
+  Contract,
+  formatUnits,
+  getAddress,
+  isAddress,
+  JsonRpcProvider,
+  Provider,
+} from "ethers";
 import { WalletVault } from "../vault/wallet-vault.js";
 import {
   importMnemonicWallet,
@@ -40,11 +51,26 @@ import {
   listRecentTradesForUser,
   listRecentTradeJobsForUser,
 } from "../db/db.js";
-import { executeBuy as executeSolanaBuy, executeSell as executeSolanaSell, quoteBuy as quoteSolanaBuy, quoteSell as quoteSolanaSell } from "../chains/solana/executor.js";
-import { executeBuy as executeEvmBuy, executeSell as executeEvmSell, quoteBuy as quoteEvmBuy, quoteSell as quoteEvmSell } from "../chains/evm/executor.js";
+import {
+  executeBuy as executeSolanaBuy,
+  executeSell as executeSolanaSell,
+  quoteBuy as quoteSolanaBuy,
+  quoteSell as quoteSolanaSell,
+} from "../chains/solana/executor.js";
+import {
+  executeBuy as executeEvmBuy,
+  executeSell as executeEvmSell,
+  quoteBuy as quoteEvmBuy,
+  quoteSell as quoteEvmSell,
+} from "../chains/evm/executor.js";
 import { assertBuyEntryEnabled, evaluateTradePolicy } from "../risk/policy.js";
 import { formatUnitsExact } from "../shared/amount.js";
-import { tradingHeading, tradingSide, tradingStatus, triggerDirection } from "./presentation.js";
+import {
+  tradingHeading,
+  tradingSide,
+  tradingStatus,
+  triggerDirection,
+} from "./presentation.js";
 import type { Wallet as EvmWallet } from "ethers";
 import { beginTrackedTrade } from "../transactions/tracker.js";
 
@@ -77,12 +103,14 @@ const ADMIN_COMMANDS = [
   { command: "admin_unflag", description: "Clear a user's flag" },
 ];
 
-export async function configureBotCommands(bot: Telegraf, adminId: string): Promise<void> {
+export async function configureBotCommands(
+  bot: Telegraf,
+  adminId: string,
+): Promise<void> {
   await bot.telegram.setMyCommands(USER_COMMANDS);
-  await bot.telegram.setMyCommands(
-    [...USER_COMMANDS, ...ADMIN_COMMANDS],
-    { scope: { type: "chat", chat_id: adminId } }
-  );
+  await bot.telegram.setMyCommands([...USER_COMMANDS, ...ADMIN_COMMANDS], {
+    scope: { type: "chat", chat_id: adminId },
+  });
 }
 
 export interface BotDeps {
@@ -93,7 +121,15 @@ export interface BotDeps {
   evmProvider: Provider;
   evmHttpProvider: JsonRpcProvider;
   adminBootstrapId: string;
-  tradingLimits: Pick<AppConfig, "maxTradeSol" | "maxTradeEth" | "maxDailySpendSol" | "maxDailySpendEth" | "maxSlippageBps" | "tradeQuoteTtlSeconds">;
+  tradingLimits: Pick<
+    AppConfig,
+    | "maxTradeSol"
+    | "maxTradeEth"
+    | "maxDailySpendSol"
+    | "maxDailySpendEth"
+    | "maxSlippageBps"
+    | "tradeQuoteTtlSeconds"
+  >;
 }
 
 const HELP_TEXT = `maestro
@@ -104,11 +140,20 @@ const HOME_TEXT = `${tradingHeading("◆", "Maestro · on-chain trading")}\nYour
 
 function homeKeyboard(isAdmin: boolean) {
   const rows = [
-    [Markup.button.callback("💼 Wallets", "home_wallets"), Markup.button.callback("📊 Portfolio", "wallets_portfolio")],
+    [
+      Markup.button.callback("💼 Wallets", "home_wallets"),
+      Markup.button.callback("📊 Portfolio", "wallets_portfolio"),
+    ],
     [Markup.button.callback("⚡ Trade", "home_trade")],
-    [Markup.button.callback("🎯 Auto-buy", "home_snipe"), Markup.button.callback("🔁 Copy trading", "home_copytrade")],
+    [
+      Markup.button.callback("🎯 Auto-buy", "home_snipe"),
+      Markup.button.callback("🔁 Copy trading", "home_copytrade"),
+    ],
     [Markup.button.callback("⚙️ Trading settings", "home_risk_settings")],
-    [Markup.button.callback("📈 Orders", "home_orders"), Markup.button.callback("🧾 Recent trades", "home_trades")],
+    [
+      Markup.button.callback("📈 Orders", "home_orders"),
+      Markup.button.callback("🧾 Recent trades", "home_trades"),
+    ],
     [Markup.button.callback("❔ Help", "home_help")],
   ];
   if (isAdmin) rows.push([Markup.button.callback("🛡 Admin", "home_admin")]);
@@ -127,23 +172,36 @@ Admin tools are available from the Admin button on the main menu.`;
 
 const walletsMenu = Markup.inlineKeyboard([
   [Markup.button.callback("📥 Import wallet", "wallets_import")],
-  [Markup.button.callback("📋 My Wallets", "wallets_list"), Markup.button.callback("📊 Portfolio", "wallets_portfolio")],
+  [
+    Markup.button.callback("📋 My Wallets", "wallets_list"),
+    Markup.button.callback("📊 Portfolio", "wallets_portfolio"),
+  ],
   [Markup.button.callback("↩️ Home", "home")],
 ]);
 
 const REVEAL_AUTO_DELETE_MS = 60_000;
-const cancelPromptKeyboard = Markup.inlineKeyboard([[Markup.button.callback("Cancel", "flow_cancel")]]);
+const cancelPromptKeyboard = Markup.inlineKeyboard([
+  [Markup.button.callback("Cancel", "flow_cancel")],
+]);
 type PendingImport = { kind: "wallet" };
 
 export function createBot(token: string, deps: BotDeps): Telegraf {
-  const { vault, db, copyRegistry, solConnection, evmProvider, evmHttpProvider, tradingLimits } = deps;
+  const {
+    vault,
+    db,
+    copyRegistry,
+    solConnection,
+    evmProvider,
+    evmHttpProvider,
+    tradingLimits,
+  } = deps;
   const bot = new Telegraf(token);
   const adminBootstrapId = deps.adminBootstrapId;
   const pendingImport = new Map<number, PendingImport>();
 
   if (!adminBootstrapId) {
     console.warn(
-      "[bot] TELEGRAM_OWNER_ID is not set — no one will be promoted to admin, which means no one can ever be approved either. Every user will be permanently stuck pending. Set it to your Telegram id before going live."
+      "[bot] TELEGRAM_OWNER_ID is not set — no one will be promoted to admin, which means no one can ever be approved either. Every user will be permanently stuck pending. Set it to your Telegram id before going live.",
     );
   }
 
@@ -151,12 +209,15 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     return `Feature not implemented yet. ${message}`.slice(0, 200);
   }
 
-  async function notifyAdminOfPendingUser(user: { telegram_id: string; username: string | null }): Promise<void> {
+  async function notifyAdminOfPendingUser(user: {
+    telegram_id: string;
+    username: string | null;
+  }): Promise<void> {
     if (!adminBootstrapId) return;
     try {
       await bot.telegram.sendMessage(
         adminBootstrapId,
-        `New user registered: ${user.telegram_id}${user.username ? ` (@${user.username})` : ""}. They must import a wallet before they can be approved.`
+        `New user registered: ${user.telegram_id}${user.username ? ` (@${user.username})` : ""}. They must import a wallet before they can be approved.`,
       );
     } catch (err) {
       // Admin may not have started a DM with the bot yet, or blocked it — not fatal, they can still /admin_pending.
@@ -168,7 +229,12 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   // Pending users may import a wallet but cannot use other features until approved.
   bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
-    const { user, isNew } = getOrCreateUser(db, String(ctx.from.id), ctx.from.username, adminBootstrapId);
+    const { user, isNew } = getOrCreateUser(
+      db,
+      String(ctx.from.id),
+      ctx.from.username,
+      adminBootstrapId,
+    );
     (ctx as any).dbUser = user;
 
     if (isNew && user.status === "pending") {
@@ -185,27 +251,44 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         await ctx.answerCbQuery(notice, { show_alert: true });
         return;
       }
-      return ctx.reply(`Feature not implemented yet.\n\n${user.admin_flag_message}`);
+      return ctx.reply(
+        `Feature not implemented yet.\n\n${user.admin_flag_message}`,
+      );
     }
 
     if (user.status === "pending") {
       const text = (ctx.message as any)?.text as string | undefined;
       const command = text?.split(/\s/, 1)[0].split("@")[0];
-      const isOnboardingCommand = command === "/start" || command === "/help" ||
-        command === "/wallets" || command === "/cancel_import";
-      const callbackData = (ctx.callbackQuery as any)?.data as string | undefined;
-      const isOnboardingAction = callbackData === "home" || callbackData === "home_help" ||
-        callbackData === "home_wallets" || callbackData === "wallets_import" || callbackData === "flow_cancel";
-      const isImportText = !!ctx.from && !!text && !text.startsWith("/") && pendingImport.has(ctx.from.id);
+      const isOnboardingCommand =
+        command === "/start" ||
+        command === "/help" ||
+        command === "/wallets" ||
+        command === "/cancel_import";
+      const callbackData = (ctx.callbackQuery as any)?.data as
+        | string
+        | undefined;
+      const isOnboardingAction =
+        callbackData === "home" ||
+        callbackData === "home_help" ||
+        callbackData === "home_wallets" ||
+        callbackData === "wallets_import" ||
+        callbackData === "flow_cancel";
+      const isImportText =
+        !!ctx.from &&
+        !!text &&
+        !text.startsWith("/") &&
+        pendingImport.has(ctx.from.id);
       if (!isOnboardingCommand && !isOnboardingAction && !isImportText) {
         if (ctx.callbackQuery) {
           await ctx.answerCbQuery(
             "Feature not implemented yet. Import a wallet and wait for admin approval.",
-            { show_alert: true }
+            { show_alert: true },
           );
           return;
         }
-        return ctx.reply("Feature not implemented yet. Import a wallet and wait for admin approval.");
+        return ctx.reply(
+          "Feature not implemented yet. Import a wallet and wait for admin approval.",
+        );
       }
     }
 
@@ -223,7 +306,8 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   function approvePendingUser(telegramId: string): string | null {
     const user = getUser(db, telegramId);
     if (!user) return "No user with that Telegram ID is registered.";
-    if (user.status !== "pending") return `User ${telegramId} is ${user.status}, not pending approval.`;
+    if (user.status !== "pending")
+      return `User ${telegramId} is ${user.status}, not pending approval.`;
     return activateUserWithImportedWallet(telegramId);
   }
 
@@ -251,8 +335,23 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   };
   type PendingInput =
     | { kind: "snipe_size"; chain: "solana" | "evm" }
-    | { kind: "risk_setting"; field: "max_trade_sol_exact" | "max_trade_eth_exact" | "max_daily_spend_sol_exact" | "max_daily_spend_eth_exact" | "max_slippage_bps" | "cooldown_seconds" }
-    | { kind: "manual_trade"; chain: "solana" | "evm"; side: "buy" | "sell"; step: "asset" | "pool" | "amount"; values: ManualTradeDraft }
+    | {
+        kind: "risk_setting";
+        field:
+          | "max_trade_sol_exact"
+          | "max_trade_eth_exact"
+          | "max_daily_spend_sol_exact"
+          | "max_daily_spend_eth_exact"
+          | "max_slippage_bps"
+          | "cooldown_seconds";
+      }
+    | {
+        kind: "manual_trade";
+        chain: "solana" | "evm";
+        side: "buy" | "sell";
+        step: "asset" | "pool" | "amount";
+        values: ManualTradeDraft;
+      }
     | { kind: "copy_target" }
     | { kind: "copy_ratio" }
     | { kind: "copy_max"; ratio: string }
@@ -261,11 +360,25 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         kind: "order_value";
         chain: "solana" | "evm";
         side: "buy" | "sell";
-        step: "identifier" | "poolRef" | "triggerPrice" | "amount" | "decimals" | "direction";
+        step:
+          | "identifier"
+          | "poolRef"
+          | "triggerPrice"
+          | "amount"
+          | "decimals"
+          | "direction";
         values: OrderDraft;
       }
-    | { kind: "admin_user_status"; status: "active" | "banned"; action: "approve" | "ban" | "unban" }
-    | { kind: "admin_flag_user"; step: "user_id" | "message"; telegramId?: string }
+    | {
+        kind: "admin_user_status";
+        status: "active" | "banned";
+        action: "approve" | "ban" | "unban";
+      }
+    | {
+        kind: "admin_flag_user";
+        step: "user_id" | "message";
+        telegramId?: string;
+      }
     | { kind: "admin_unflag_user" };
 
   type ManualTradeQuote = {
@@ -287,7 +400,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   };
 
   const pendingInputs = new Map<number, PendingInput>();
-  const killSwitchConfirmations = new Map<string, { userId: string; enabled: boolean; expiresAt: number }>();
+  const killSwitchConfirmations = new Map<
+    string,
+    { userId: string; enabled: boolean; expiresAt: number }
+  >();
   const manualTradeQuotes = new Map<string, ManualTradeQuote>();
 
   function getSolanaTradeWallet(userId: string): Keypair {
@@ -310,7 +426,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     userId: string,
     chain: "solana" | "evm",
     side: "buy" | "sell",
-    values: ManualTradeDraft
+    values: ManualTradeDraft,
   ): Promise<{ id: string; quote: ManualTradeQuote }> {
     if (!values.amount) throw new Error("Trade amount is missing.");
     const amount = values.amount;
@@ -321,7 +437,8 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       amount,
       source: "manual",
     });
-    if (!policy.allowed) throw new Error(`Trade not allowed: ${policy.reasons.join(", ")}.`);
+    if (!policy.allowed)
+      throw new Error(`Trade not allowed: ${policy.reasons.join(", ")}.`);
 
     let quote: ManualTradeQuote;
     if (chain === "solana") {
@@ -332,15 +449,34 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       let inputDecimals = 9;
       let asset = "";
       if (side === "buy") {
-        if (!isPositiveDecimal(amount, 9)) throw new Error("Enter a valid SOL amount with up to 9 decimal places.");
+        if (!isPositiveDecimal(amount, 9))
+          throw new Error(
+            "Enter a valid SOL amount with up to 9 decimal places.",
+          );
         amountBaseUnits = parseUnitsExact(amount, 9);
-        const result = await quoteSolanaBuy({ connection: solConnection, wallet, poolId, amountInLamports: amountBaseUnits, slippageBps: policy.maxSlippageBps });
+        const result = await quoteSolanaBuy({
+          connection: solConnection,
+          wallet,
+          poolId,
+          amountInLamports: amountBaseUnits,
+          slippageBps: policy.maxSlippageBps,
+        });
         asset = result.outputMint;
         quote = {
-          userId, chain, side, asset, poolId, amount, amountBaseUnits, inputDecimals,
-          outputMint: result.outputMint, expectedAmountOut: result.expectedAmountOut,
-          minimumAmountOut: result.minimumAmountOut, outputDecimals: result.outputDecimals,
-          slippageBps: policy.maxSlippageBps, requiresApproval: false,
+          userId,
+          chain,
+          side,
+          asset,
+          poolId,
+          amount,
+          amountBaseUnits,
+          inputDecimals,
+          outputMint: result.outputMint,
+          expectedAmountOut: result.expectedAmountOut,
+          minimumAmountOut: result.minimumAmountOut,
+          outputDecimals: result.outputDecimals,
+          slippageBps: policy.maxSlippageBps,
+          requiresApproval: false,
           expiresAt: Date.now() + tradingLimits.tradeQuoteTtlSeconds * 1000,
         };
       } else {
@@ -349,75 +485,150 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         asset = mint.toBase58();
         const [mintInfo, tokenAccounts] = await Promise.all([
           solConnection.getTokenSupply(mint),
-          solConnection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint }),
+          solConnection.getParsedTokenAccountsByOwner(wallet.publicKey, {
+            mint,
+          }),
         ]);
         inputDecimals = mintInfo.value.decimals;
-        if (!isPositiveDecimal(amount, inputDecimals)) throw new Error(`Enter a positive token amount with up to ${inputDecimals} decimal places.`);
+        if (!isPositiveDecimal(amount, inputDecimals))
+          throw new Error(
+            `Enter a positive token amount with up to ${inputDecimals} decimal places.`,
+          );
         amountBaseUnits = parseUnitsExact(amount, inputDecimals);
-        const balance = tokenAccounts.value.reduce((sum, account) => sum + BigInt(account.account.data.parsed.info.tokenAmount.amount), 0n);
-        if (amountBaseUnits > balance) throw new Error(`Insufficient token balance. Available: ${formatUnitsExact(balance, inputDecimals)}.`);
+        const balance = tokenAccounts.value.reduce(
+          (sum, account) =>
+            sum + BigInt(account.account.data.parsed.info.tokenAmount.amount),
+          0n,
+        );
+        if (amountBaseUnits > balance)
+          throw new Error(
+            `Insufficient token balance. Available: ${formatUnitsExact(balance, inputDecimals)}.`,
+          );
         const result = await quoteSolanaSell({
-          connection: solConnection, wallet, poolId, tokenMint: asset,
-          amountInTokenBaseUnits: amountBaseUnits, slippageBps: policy.maxSlippageBps,
+          connection: solConnection,
+          wallet,
+          poolId,
+          tokenMint: asset,
+          amountInTokenBaseUnits: amountBaseUnits,
+          slippageBps: policy.maxSlippageBps,
         });
         quote = {
-          userId, chain, side, asset, poolId, amount, amountBaseUnits, inputDecimals,
-          outputMint: result.outputMint, expectedAmountOut: result.expectedAmountOut,
-          minimumAmountOut: result.minimumAmountOut, outputDecimals: result.outputDecimals,
-          slippageBps: policy.maxSlippageBps, requiresApproval: false,
+          userId,
+          chain,
+          side,
+          asset,
+          poolId,
+          amount,
+          amountBaseUnits,
+          inputDecimals,
+          outputMint: result.outputMint,
+          expectedAmountOut: result.expectedAmountOut,
+          minimumAmountOut: result.minimumAmountOut,
+          outputDecimals: result.outputDecimals,
+          slippageBps: policy.maxSlippageBps,
+          requiresApproval: false,
           expiresAt: Date.now() + tradingLimits.tradeQuoteTtlSeconds * 1000,
         };
       }
     } else {
-      if (!values.asset || !isAddress(values.asset)) throw new Error("Enter a valid EVM token address.");
+      if (!values.asset || !isAddress(values.asset))
+        throw new Error("Enter a valid EVM token address.");
       const asset = getAddress(values.asset);
       const wallet = getEvmTradeWallet(userId);
       if (side === "buy") {
-        if (!isPositiveDecimal(amount, 18)) throw new Error("Enter a valid ETH amount with up to 18 decimal places.");
+        if (!isPositiveDecimal(amount, 18))
+          throw new Error(
+            "Enter a valid ETH amount with up to 18 decimal places.",
+          );
         const amountBaseUnits = parseUnitsExact(amount, 18);
         const result = await quoteEvmBuy({
-          provider: evmHttpProvider, tokenAddress: asset, amountInEth: amount, slippageBps: policy.maxSlippageBps,
+          provider: evmHttpProvider,
+          tokenAddress: asset,
+          amountInEth: amount,
+          slippageBps: policy.maxSlippageBps,
         });
         quote = {
-          userId, chain, side, asset, amount, amountBaseUnits, inputDecimals: 18,
-          expectedAmountOut: result.expectedAmountOut, minimumAmountOut: result.minimumAmountOut,
-          outputDecimals: result.outputDecimals, slippageBps: policy.maxSlippageBps,
-          requiresApproval: false, expiresAt: Date.now() + tradingLimits.tradeQuoteTtlSeconds * 1000,
+          userId,
+          chain,
+          side,
+          asset,
+          amount,
+          amountBaseUnits,
+          inputDecimals: 18,
+          expectedAmountOut: result.expectedAmountOut,
+          minimumAmountOut: result.minimumAmountOut,
+          outputDecimals: result.outputDecimals,
+          slippageBps: policy.maxSlippageBps,
+          requiresApproval: false,
+          expiresAt: Date.now() + tradingLimits.tradeQuoteTtlSeconds * 1000,
         };
       } else {
-        const token = new Contract(asset, ["function decimals() view returns (uint8)", "function balanceOf(address) view returns (uint256)"], evmHttpProvider);
+        const token = new Contract(
+          asset,
+          [
+            "function decimals() view returns (uint8)",
+            "function balanceOf(address) view returns (uint256)",
+          ],
+          evmHttpProvider,
+        );
         const [decimals, balance] = await Promise.all([
           token.decimals() as Promise<bigint>,
           token.balanceOf(wallet.address) as Promise<bigint>,
         ]);
         const inputDecimals = Number(decimals);
-        if (!Number.isInteger(inputDecimals) || inputDecimals < 0 || inputDecimals > 255 || !isPositiveDecimal(amount, inputDecimals)) {
-          throw new Error("Enter a positive token amount with a valid token precision.");
+        if (
+          !Number.isInteger(inputDecimals) ||
+          inputDecimals < 0 ||
+          inputDecimals > 255 ||
+          !isPositiveDecimal(amount, inputDecimals)
+        ) {
+          throw new Error(
+            "Enter a positive token amount with a valid token precision.",
+          );
         }
         const amountBaseUnits = parseUnitsExact(amount, inputDecimals);
-        if (amountBaseUnits > balance) throw new Error(`Insufficient token balance. Available: ${formatUnits(balance, inputDecimals)}.`);
+        if (amountBaseUnits > balance)
+          throw new Error(
+            `Insufficient token balance. Available: ${formatUnits(balance, inputDecimals)}.`,
+          );
         const result = await quoteEvmSell({
-          provider: evmHttpProvider, wallet, tokenAddress: asset, amountInTokenBaseUnits: amountBaseUnits,
+          provider: evmHttpProvider,
+          wallet,
+          tokenAddress: asset,
+          amountInTokenBaseUnits: amountBaseUnits,
           slippageBps: policy.maxSlippageBps,
         });
         quote = {
-          userId, chain, side, asset, amount, amountBaseUnits, inputDecimals,
-          expectedAmountOut: result.expectedAmountOut, minimumAmountOut: result.minimumAmountOut,
-          outputDecimals: result.outputDecimals, slippageBps: policy.maxSlippageBps,
-          requiresApproval: result.requiresApproval, expiresAt: Date.now() + tradingLimits.tradeQuoteTtlSeconds * 1000,
+          userId,
+          chain,
+          side,
+          asset,
+          amount,
+          amountBaseUnits,
+          inputDecimals,
+          expectedAmountOut: result.expectedAmountOut,
+          minimumAmountOut: result.minimumAmountOut,
+          outputDecimals: result.outputDecimals,
+          slippageBps: policy.maxSlippageBps,
+          requiresApproval: result.requiresApproval,
+          expiresAt: Date.now() + tradingLimits.tradeQuoteTtlSeconds * 1000,
         };
       }
     }
 
     for (const [id, existing] of manualTradeQuotes) {
-      if (existing.expiresAt <= Date.now() || existing.userId === userId) manualTradeQuotes.delete(id);
+      if (existing.expiresAt <= Date.now() || existing.userId === userId)
+        manualTradeQuotes.delete(id);
     }
     const id = randomUUID();
     manualTradeQuotes.set(id, quote);
     return { id, quote };
   }
 
-  function askOrderValue(ctx: any, pending: Extract<PendingInput, { kind: "order_value" }>) {
+  function askOrderValue(
+    ctx: any,
+    pending: Extract<PendingInput, { kind: "order_value" }>,
+  ) {
     pendingInputs.set(ctx.from!.id, pending);
     const prompts = {
       identifier: "Send the token mint (Solana) or token address (EVM).",
@@ -428,7 +639,8 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           ? `Send the amount to spend in ${pending.chain === "solana" ? "SOL" : "ETH"}.`
           : "Send the token amount to sell.",
       decimals: "Send the token decimals (an integer from 0 to 255).",
-      direction: "Choose whether the trigger is above or below the target price.",
+      direction:
+        "Choose whether the trigger is above or below the target price.",
     };
     return ctx.reply(prompts[pending.step], cancelPromptKeyboard);
   }
@@ -441,7 +653,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         hasWallet
           ? "Your wallet is imported. Your account is waiting for admin approval; other features remain locked until approval."
           : "Welcome to Maestro. Import a wallet to request admin approval. Other features remain locked until an admin approves your account.",
-        onboardingKeyboard()
+        onboardingKeyboard(),
       );
     }
     return ctx.reply(HOME_TEXT, homeKeyboard(user?.role === "admin"));
@@ -451,7 +663,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   bot.help((ctx) => {
     const user = (ctx as any).dbUser;
     if (user?.status === "pending") return showStartScreen(ctx);
-    return ctx.reply(HELP_TEXT + (user?.role === "admin" ? "\n" + ADMIN_HELP_TEXT : ""), homeKeyboard(user?.role === "admin"));
+    return ctx.reply(
+      HELP_TEXT + (user?.role === "admin" ? "\n" + ADMIN_HELP_TEXT : ""),
+      homeKeyboard(user?.role === "admin"),
+    );
   });
 
   bot.action("home", async (ctx) => {
@@ -464,7 +679,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   bot.action("home_wallets", async (ctx) => {
     await ctx.answerCbQuery();
     if ((ctx as any).dbUser?.status === "pending") {
-      return ctx.reply("Import a wallet to request admin approval. Other wallet and trading features unlock after approval.", onboardingKeyboard());
+      return ctx.reply(
+        "Import a wallet to request admin approval. Other wallet and trading features unlock after approval.",
+        onboardingKeyboard(),
+      );
     }
     await ctx.reply("Wallets", walletsMenu);
   });
@@ -474,9 +692,12 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.reply(
       "Choose a manual trade. Every trade requires a fresh quote and your explicit confirmation.",
       Markup.inlineKeyboard([
-        [Markup.button.callback("🟢 Buy", "trade_start_buy"), Markup.button.callback("🔴 Sell", "trade_start_sell")],
+        [
+          Markup.button.callback("🟢 Buy", "trade_start_buy"),
+          Markup.button.callback("🔴 Sell", "trade_start_sell"),
+        ],
         [Markup.button.callback("↩️ Home", "home")],
-      ])
+      ]),
     );
   });
 
@@ -485,28 +706,44 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const trades = listRecentTradesForUser(db, String(ctx.from!.id), 10);
     const jobs = listRecentTradeJobsForUser(db, String(ctx.from!.id), 10);
     const lifecycleText = trades.map((trade) => {
-          const date = new Date(trade.created_at).toISOString().replace("T", " ").slice(0, 19);
-          const ref = trade.transaction_ref ?? trade.approval_transaction_ref;
-          const error = trade.error ? `\n  Note: ${trade.error}` : "";
-          return `${tradingSide(trade.side)} ${trade.amount} · ${trade.chain.toUpperCase()} · ${trade.source}\n${tradingStatus(trade.status)} · ${date}` +
-            `${ref ? `\n  Tx: ${ref}` : ""}${trade.bundle_ref ? `\n  Bundle: ${trade.bundle_ref}` : ""}${error}`;
-        });
+      const date = new Date(trade.created_at)
+        .toISOString()
+        .replace("T", " ")
+        .slice(0, 19);
+      const ref = trade.transaction_ref ?? trade.approval_transaction_ref;
+      const error = trade.error ? `\n  Note: ${trade.error}` : "";
+      return (
+        `${tradingSide(trade.side)} ${trade.amount} · ${trade.chain.toUpperCase()} · ${trade.source}\n${tradingStatus(trade.status)} · ${date}` +
+        `${ref ? `\n  Tx: ${ref}` : ""}${trade.bundle_ref ? `\n  Bundle: ${trade.bundle_ref}` : ""}${error}`
+      );
+    });
     const jobText = jobs
-      .filter((job) => !job.lifecycle_id || !trades.some((trade) => trade.id === job.lifecycle_id))
+      .filter(
+        (job) =>
+          !job.lifecycle_id ||
+          !trades.some((trade) => trade.id === job.lifecycle_id),
+      )
       .map((job) => {
-        const date = new Date(job.created_at).toISOString().replace("T", " ").slice(0, 19);
+        const date = new Date(job.created_at)
+          .toISOString()
+          .replace("T", " ")
+          .slice(0, 19);
         const error = job.last_error ? `\n  Note: ${job.last_error}` : "";
         return `${tradingSide(job.side)} ${job.amount} · ${job.chain.toUpperCase()} · ${job.source}\n${tradingStatus(job.status)} · ${date} · ${job.attempts}/${job.max_attempts}${error}`;
       });
-    const text = [...jobText, ...lifecycleText].length === 0
-      ? "No tracked trades yet."
-      : [...jobText, ...lifecycleText].join("\n\n");
+    const text =
+      [...jobText, ...lifecycleText].length === 0
+        ? "No tracked trades yet."
+        : [...jobText, ...lifecycleText].join("\n\n");
     await ctx.reply(
       `${tradingHeading("📈", "Recent trades")}\n${text}\n\n${tradingSide("buy")} · ${tradingSide("sell")}\nUnknown means the RPC did not provide a final status in time; reconciliation continues.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("🔄 Refresh", "home_trades"), Markup.button.callback("🔄 Trade", "home_trade")],
+        [
+          Markup.button.callback("🔄 Refresh", "home_trades"),
+          Markup.button.callback("🔄 Trade", "home_trade"),
+        ],
         [Markup.button.callback("↩️ Home", "home")],
-      ])
+      ]),
     );
   });
 
@@ -516,9 +753,12 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.reply(
       `Choose the chain for your manual ${side}.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("Solana", `trade_chain_${side}_solana`), Markup.button.callback("EVM", `trade_chain_${side}_evm`)],
+        [
+          Markup.button.callback("Solana", `trade_chain_${side}_solana`),
+          Markup.button.callback("EVM", `trade_chain_${side}_evm`),
+        ],
         [Markup.button.callback("Cancel", "flow_cancel")],
-      ])
+      ]),
     );
   });
 
@@ -528,13 +768,20 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const chain = ctx.match[2] as "solana" | "evm";
     const step: Extract<PendingInput, { kind: "manual_trade" }>["step"] =
       chain === "evm" || side === "sell" ? "asset" : "pool";
-    const pending = { kind: "manual_trade" as const, side, chain, step, values: {} };
+    const pending = {
+      kind: "manual_trade" as const,
+      side,
+      chain,
+      step,
+      values: {},
+    };
     pendingInputs.set(ctx.from!.id, pending);
-    const prompt = step === "asset"
-      ? chain === "solana"
-        ? "Send the Solana token mint to sell."
-        : "Send the EVM token contract address."
-      : "Send the Raydium SOL/token pool ID.";
+    const prompt =
+      step === "asset"
+        ? chain === "solana"
+          ? "Send the Solana token mint to sell."
+          : "Send the EVM token contract address."
+        : "Send the Raydium SOL/token pool ID.";
     await ctx.reply(prompt, cancelPromptKeyboard);
   });
 
@@ -542,12 +789,16 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const id = ctx.match[1];
     const quote = manualTradeQuotes.get(id);
     if (!quote || quote.userId !== String(ctx.from!.id)) {
-      return ctx.answerCbQuery("This quote is unavailable or belongs to another user.");
+      return ctx.answerCbQuery(
+        "This quote is unavailable or belongs to another user.",
+      );
     }
     manualTradeQuotes.delete(id);
     await ctx.answerCbQuery();
     if (quote.expiresAt <= Date.now()) {
-      return ctx.reply("This quote expired. Request a new quote before trading.");
+      return ctx.reply(
+        "This quote expired. Request a new quote before trading.",
+      );
     }
 
     const decision = evaluateTradePolicy(db, tradingLimits, {
@@ -558,10 +809,14 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       source: "manual",
     });
     if (!decision.allowed) {
-      return ctx.reply(`Trade not allowed: ${decision.reasons.join(", ")}. Request a new quote after resolving this.`);
+      return ctx.reply(
+        `Trade not allowed: ${decision.reasons.join(", ")}. Request a new quote after resolving this.`,
+      );
     }
     if (quote.slippageBps > decision.maxSlippageBps) {
-      return ctx.reply("Your slippage ceiling changed after this quote. Request a fresh quote before trading.");
+      return ctx.reply(
+        "Your slippage ceiling changed after this quote. Request a fresh quote before trading.",
+      );
     }
 
     let lifecycle: ReturnType<typeof beginTrackedTrade> | undefined;
@@ -583,9 +838,14 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           source: "manual",
           excludeLifecycleId: lifecycle!.id,
         });
-        if (!latest.allowed) throw new Error(`Risk policy changed before submission: ${latest.reasons.join(", ")}.`);
+        if (!latest.allowed)
+          throw new Error(
+            `Risk policy changed before submission: ${latest.reasons.join(", ")}.`,
+          );
         if (latest.maxSlippageBps < quote.slippageBps) {
-          throw new Error("Slippage ceiling changed before submission; request a fresh quote.");
+          throw new Error(
+            "Slippage ceiling changed before submission; request a fresh quote.",
+          );
         }
         assertBuyEntryEnabled(db, quote.userId, quote.chain, "manual");
       };
@@ -598,59 +858,64 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           source: "manual",
         });
         if (latest.maxSlippageBps < quote.slippageBps) {
-          throw new Error("Slippage ceiling changed before submission; request a fresh quote.");
+          throw new Error(
+            "Slippage ceiling changed before submission; request a fresh quote.",
+          );
         }
       };
       let submissionId: string;
       if (quote.chain === "solana") {
         const wallet = getSolanaTradeWallet(quote.userId);
         const poolId = quote.poolId!;
-        submissionId = quote.side === "buy"
-          ? await executeSolanaBuy({
-              connection: solConnection,
-              wallet,
-              poolId,
-              amountInLamports: quote.amountBaseUnits,
-              slippageBps: quote.slippageBps,
-              approvedMinimumOut: quote.minimumAmountOut,
-              assertCanSubmit: assertCurrentBuyPolicy,
-              onLifecycleEvent: lifecycle.observe,
-            })
-          : await executeSolanaSell({
-              connection: solConnection,
-              wallet,
-              poolId,
-              amountInTokenBaseUnits: quote.amountBaseUnits,
-              slippageBps: quote.slippageBps,
-              assertCanSubmit: assertCurrentSellSlippage,
-              approvedMinimumOut: quote.minimumAmountOut,
-              onLifecycleEvent: lifecycle.observe,
-            });
+        submissionId =
+          quote.side === "buy"
+            ? await executeSolanaBuy({
+                connection: solConnection,
+                wallet,
+                poolId,
+                amountInLamports: quote.amountBaseUnits,
+                slippageBps: quote.slippageBps,
+                approvedMinimumOut: quote.minimumAmountOut,
+                assertCanSubmit: assertCurrentBuyPolicy,
+                onLifecycleEvent: lifecycle.observe,
+              })
+            : await executeSolanaSell({
+                connection: solConnection,
+                wallet,
+                poolId,
+                amountInTokenBaseUnits: quote.amountBaseUnits,
+                slippageBps: quote.slippageBps,
+                assertCanSubmit: assertCurrentSellSlippage,
+                approvedMinimumOut: quote.minimumAmountOut,
+                onLifecycleEvent: lifecycle.observe,
+              });
       } else {
         const wallet = getEvmTradeWallet(quote.userId);
-        submissionId = quote.side === "buy"
-          ? await executeEvmBuy({
-              provider: evmHttpProvider,
-              wallet,
-              tokenAddress: quote.asset,
-              amountInEth: quote.amount,
-              slippageBps: quote.slippageBps,
-              approvedMinimumOut: quote.minimumAmountOut,
-              assertCanSubmit: assertCurrentBuyPolicy,
-              onLifecycleEvent: lifecycle.observe,
-            })
-          : await executeEvmSell({
-              provider: evmHttpProvider,
-              wallet,
-              tokenAddress: quote.asset,
-              amountInTokenBaseUnits: quote.amountBaseUnits,
-              slippageBps: quote.slippageBps,
-              assertCanSubmit: assertCurrentSellSlippage,
-              approvedMinimumOut: quote.minimumAmountOut,
-              confirmedRequiresApproval: quote.requiresApproval,
-              onLifecycleEvent: lifecycle.observe,
-            });
-        if (quote.side === "buy") recordHolding(db, "evm", quote.userId, quote.asset);
+        submissionId =
+          quote.side === "buy"
+            ? await executeEvmBuy({
+                provider: evmHttpProvider,
+                wallet,
+                tokenAddress: quote.asset,
+                amountInEth: quote.amount,
+                slippageBps: quote.slippageBps,
+                approvedMinimumOut: quote.minimumAmountOut,
+                assertCanSubmit: assertCurrentBuyPolicy,
+                onLifecycleEvent: lifecycle.observe,
+              })
+            : await executeEvmSell({
+                provider: evmHttpProvider,
+                wallet,
+                tokenAddress: quote.asset,
+                amountInTokenBaseUnits: quote.amountBaseUnits,
+                slippageBps: quote.slippageBps,
+                assertCanSubmit: assertCurrentSellSlippage,
+                approvedMinimumOut: quote.minimumAmountOut,
+                confirmedRequiresApproval: quote.requiresApproval,
+                onLifecycleEvent: lifecycle.observe,
+              });
+        if (quote.side === "buy")
+          recordHolding(db, "evm", quote.userId, quote.asset);
       }
       recordSecurityEvent(db, {
         eventType: "MANUAL_TRADE_SUBMITTED",
@@ -660,21 +925,32 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         side: quote.side,
         amount: quote.amount,
         source: "manual",
-        details: { asset: quote.asset, poolId: quote.poolId ?? null, submissionId },
+        details: {
+          asset: quote.asset,
+          poolId: quote.poolId ?? null,
+          submissionId,
+        },
       });
       await ctx.reply(
-        `${tradingHeading("🟡", "Trade submitted")}\nTracking ID: ${lifecycle.id}\nTransaction: ${submissionId}`
+        `${tradingHeading("🟡", "Trade submitted")}\nTracking ID: ${lifecycle.id}\nTransaction: ${submissionId}`,
       );
     } catch (err) {
       lifecycle?.failIfNotSubmitted(err);
-      console.error(`[trade] confirmed ${quote.chain} ${quote.side} failed for user ${quote.userId}:`, err);
+      console.error(
+        `[trade] confirmed ${quote.chain} ${quote.side} failed for user ${quote.userId}:`,
+        err,
+      );
       if (lifecycle?.wasSubmitted) {
         await ctx.reply(
           `Submission status is not yet known (${err instanceof Error ? err.message : "network error"}). Check Recent trades before retrying to avoid a duplicate trade.`,
-          Markup.inlineKeyboard([[Markup.button.callback("🧾 Recent trades", "home_trades")]])
+          Markup.inlineKeyboard([
+            [Markup.button.callback("🧾 Recent trades", "home_trades")],
+          ]),
         );
       } else {
-        await ctx.reply(`Trade was not submitted: ${err instanceof Error ? err.message : "unknown error"}. Request a fresh quote to try again.`);
+        await ctx.reply(
+          `Trade was not submitted: ${err instanceof Error ? err.message : "unknown error"}. Request a fresh quote to try again.`,
+        );
       }
     }
   });
@@ -684,13 +960,19 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const quote = manualTradeQuotes.get(id);
     if (quote?.userId === String(ctx.from!.id)) manualTradeQuotes.delete(id);
     await ctx.answerCbQuery("Quote cancelled.");
-    await ctx.reply("Quote cancelled.", homeKeyboard((ctx as any).dbUser?.role === "admin"));
+    await ctx.reply(
+      "Quote cancelled.",
+      homeKeyboard((ctx as any).dbUser?.role === "admin"),
+    );
   });
 
   bot.action("home_help", async (ctx) => {
     await ctx.answerCbQuery();
     const user = (ctx as any).dbUser;
-    await ctx.reply(HELP_TEXT + (user?.role === "admin" ? "\n" + ADMIN_HELP_TEXT : ""), homeKeyboard(user?.role === "admin"));
+    await ctx.reply(
+      HELP_TEXT + (user?.role === "admin" ? "\n" + ADMIN_HELP_TEXT : ""),
+      homeKeyboard(user?.role === "admin"),
+    );
   });
 
   async function showSnipeSettings(ctx: any) {
@@ -698,32 +980,77 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.reply(
       `AUTO-BUY · ${user.snipe_enabled ? "ON" : "OFF"}\n\nWhen enabled, new-pair detection can place real mainnet trades from your primary wallet.\n\nTrade sizes: ${user.snipe_size_sol_exact} SOL / ${user.snipe_size_eth_exact} ETH.\nYour per-buy limits: ${user.max_trade_sol_exact} SOL / ${user.max_trade_eth_exact} ETH (admin hard caps: ${tradingLimits.maxTradeSol} SOL / ${tradingLimits.maxTradeEth} ETH).`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("✅ Enable", "home_snipe_enable"), Markup.button.callback("⏸ Disable", "home_snipe_disable")],
-        [Markup.button.callback("Set SOL size", "home_snipe_size_solana"), Markup.button.callback("Set ETH size", "home_snipe_size_evm")],
-        [Markup.button.callback("⚙️ Trading limits", "home_risk_settings"), Markup.button.callback("↩️ Home", "home")],
-      ])
+        [
+          Markup.button.callback("✅ Enable", "home_snipe_enable"),
+          Markup.button.callback("⏸ Disable", "home_snipe_disable"),
+        ],
+        [
+          Markup.button.callback("Set SOL size", "home_snipe_size_solana"),
+          Markup.button.callback("Set ETH size", "home_snipe_size_evm"),
+        ],
+        [
+          Markup.button.callback("⚙️ Trading limits", "home_risk_settings"),
+          Markup.button.callback("↩️ Home", "home"),
+        ],
+      ]),
     );
   }
 
   async function showRiskSettings(ctx: any) {
     const user = getUser(db, String(ctx.from!.id))!;
-    const solBuyCap = parseUnitsExact(user.max_trade_sol_exact, 9) < parseUnitsExact(tradingLimits.maxTradeSol, 9)
-      ? user.max_trade_sol_exact : tradingLimits.maxTradeSol;
-    const ethBuyCap = parseUnitsExact(user.max_trade_eth_exact, 18) < parseUnitsExact(tradingLimits.maxTradeEth, 18)
-      ? user.max_trade_eth_exact : tradingLimits.maxTradeEth;
-    const solDailyCap = parseUnitsExact(user.max_daily_spend_sol_exact, 9) < parseUnitsExact(tradingLimits.maxDailySpendSol, 9)
-      ? user.max_daily_spend_sol_exact : tradingLimits.maxDailySpendSol;
-    const ethDailyCap = parseUnitsExact(user.max_daily_spend_eth_exact, 18) < parseUnitsExact(tradingLimits.maxDailySpendEth, 18)
-      ? user.max_daily_spend_eth_exact : tradingLimits.maxDailySpendEth;
+    const solBuyCap =
+      parseUnitsExact(user.max_trade_sol_exact, 9) <
+      parseUnitsExact(tradingLimits.maxTradeSol, 9)
+        ? user.max_trade_sol_exact
+        : tradingLimits.maxTradeSol;
+    const ethBuyCap =
+      parseUnitsExact(user.max_trade_eth_exact, 18) <
+      parseUnitsExact(tradingLimits.maxTradeEth, 18)
+        ? user.max_trade_eth_exact
+        : tradingLimits.maxTradeEth;
+    const solDailyCap =
+      parseUnitsExact(user.max_daily_spend_sol_exact, 9) <
+      parseUnitsExact(tradingLimits.maxDailySpendSol, 9)
+        ? user.max_daily_spend_sol_exact
+        : tradingLimits.maxDailySpendSol;
+    const ethDailyCap =
+      parseUnitsExact(user.max_daily_spend_eth_exact, 18) <
+      parseUnitsExact(tradingLimits.maxDailySpendEth, 18)
+        ? user.max_daily_spend_eth_exact
+        : tradingLimits.maxDailySpendEth;
     await ctx.reply(
       `TRADING SETTINGS\n\nEffective per-buy cap: ${solBuyCap} SOL / ${ethBuyCap} ETH (admin hard maximum ${tradingLimits.maxTradeSol} SOL / ${tradingLimits.maxTradeEth} ETH).\nEffective daily buy budget (UTC): ${solDailyCap} SOL / ${ethDailyCap} ETH (admin hard maximum ${tradingLimits.maxDailySpendSol} SOL / ${tradingLimits.maxDailySpendEth} ETH).\nSlippage ceiling: ${Math.min(user.max_slippage_bps, tradingLimits.maxSlippageBps)} bps (admin hard maximum ${tradingLimits.maxSlippageBps} bps).\nBuy cooldown: ${user.cooldown_seconds} seconds.\n\nThese limits apply to manual buys, auto-buy, copy-trading, and buy limit orders. Sell orders remain available. Auto-buy sizes and copy-trading options are configured in their own menus.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("Set SOL buy cap", "risk_edit_max_trade_sol_exact"), Markup.button.callback("Set ETH buy cap", "risk_edit_max_trade_eth_exact")],
-        [Markup.button.callback("Set SOL daily budget", "risk_edit_max_daily_spend_sol_exact"), Markup.button.callback("Set ETH daily budget", "risk_edit_max_daily_spend_eth_exact")],
-        [Markup.button.callback("Set slippage", "risk_edit_max_slippage_bps"), Markup.button.callback("Set cooldown", "risk_edit_cooldown_seconds")],
-        [Markup.button.callback("🎯 Auto-buy settings", "home_snipe"), Markup.button.callback("🔁 Copy settings", "home_copytrade")],
+        [
+          Markup.button.callback(
+            "Set SOL buy cap",
+            "risk_edit_max_trade_sol_exact",
+          ),
+          Markup.button.callback(
+            "Set ETH buy cap",
+            "risk_edit_max_trade_eth_exact",
+          ),
+        ],
+        [
+          Markup.button.callback(
+            "Set SOL daily budget",
+            "risk_edit_max_daily_spend_sol_exact",
+          ),
+          Markup.button.callback(
+            "Set ETH daily budget",
+            "risk_edit_max_daily_spend_eth_exact",
+          ),
+        ],
+        [
+          Markup.button.callback("Set slippage", "risk_edit_max_slippage_bps"),
+          Markup.button.callback("Set cooldown", "risk_edit_cooldown_seconds"),
+        ],
+        [
+          Markup.button.callback("🎯 Auto-buy settings", "home_snipe"),
+          Markup.button.callback("🔁 Copy settings", "home_copytrade"),
+        ],
         [Markup.button.callback("↩️ Home", "home")],
-      ])
+      ]),
     );
   }
 
@@ -732,20 +1059,26 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await showRiskSettings(ctx);
   });
 
-  bot.action(/^risk_edit_(max_trade_sol_exact|max_trade_eth_exact|max_daily_spend_sol_exact|max_daily_spend_eth_exact|max_slippage_bps|cooldown_seconds)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const field = ctx.match[1] as Extract<PendingInput, { kind: "risk_setting" }>["field"];
-    pendingInputs.set(ctx.from!.id, { kind: "risk_setting", field });
-    const prompts: Record<typeof field, string> = {
-      max_trade_sol_exact: `Send your maximum SOL per buy (greater than 0; admin maximum ${tradingLimits.maxTradeSol}).`,
-      max_trade_eth_exact: `Send your maximum ETH per buy (greater than 0; admin maximum ${tradingLimits.maxTradeEth}).`,
-      max_daily_spend_sol_exact: `Send your SOL daily buy budget in UTC (0 to the admin maximum ${tradingLimits.maxDailySpendSol}; 0 disables buys).`,
-      max_daily_spend_eth_exact: `Send your ETH daily buy budget in UTC (0 to the admin maximum ${tradingLimits.maxDailySpendEth}; 0 disables buys).`,
-      max_slippage_bps: `Send your maximum slippage in basis points (1–${tradingLimits.maxSlippageBps}).`,
-      cooldown_seconds: "Send your buy cooldown in whole seconds (0–3600).",
-    };
-    await ctx.reply(prompts[field], cancelPromptKeyboard);
-  });
+  bot.action(
+    /^risk_edit_(max_trade_sol_exact|max_trade_eth_exact|max_daily_spend_sol_exact|max_daily_spend_eth_exact|max_slippage_bps|cooldown_seconds)$/,
+    async (ctx) => {
+      await ctx.answerCbQuery();
+      const field = ctx.match[1] as Extract<
+        PendingInput,
+        { kind: "risk_setting" }
+      >["field"];
+      pendingInputs.set(ctx.from!.id, { kind: "risk_setting", field });
+      const prompts: Record<typeof field, string> = {
+        max_trade_sol_exact: `Send your maximum SOL per buy (greater than 0; admin maximum ${tradingLimits.maxTradeSol}).`,
+        max_trade_eth_exact: `Send your maximum ETH per buy (greater than 0; admin maximum ${tradingLimits.maxTradeEth}).`,
+        max_daily_spend_sol_exact: `Send your SOL daily buy budget in UTC (0 to the admin maximum ${tradingLimits.maxDailySpendSol}; 0 disables buys).`,
+        max_daily_spend_eth_exact: `Send your ETH daily buy budget in UTC (0 to the admin maximum ${tradingLimits.maxDailySpendEth}; 0 disables buys).`,
+        max_slippage_bps: `Send your maximum slippage in basis points (1–${tradingLimits.maxSlippageBps}).`,
+        cooldown_seconds: "Send your buy cooldown in whole seconds (0–3600).",
+      };
+      await ctx.reply(prompts[field], cancelPromptKeyboard);
+    },
+  );
 
   bot.action("home_snipe", async (ctx) => {
     await ctx.answerCbQuery();
@@ -768,7 +1101,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     const chain = ctx.match[1] as "solana" | "evm";
     pendingInputs.set(ctx.from!.id, { kind: "snipe_size", chain });
-    await ctx.reply(`Send the new ${chain === "solana" ? "SOL" : "ETH"} auto-buy size.`, cancelPromptKeyboard);
+    await ctx.reply(
+      `Send the new ${chain === "solana" ? "SOL" : "ETH"} auto-buy size.`,
+      cancelPromptKeyboard,
+    );
   });
 
   bot.action("home_copytrade", async (ctx) => {
@@ -778,29 +1114,50 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.reply(
       `COPY TRADING · ${target ? "ON" : "OFF"}${target ? `\n\nFollowing: ${target}` : "\n\nNo wallet is being followed."}\n\nSizing: ${user.copy_size_ratio_exact} ratio, max ${user.copy_max_amount_exact}, copy sells ${user.copy_sells ? "on" : "off"}.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback(target ? "Change target wallet" : "Set target wallet", "home_copytrade_set")],
+        [
+          Markup.button.callback(
+            target ? "Change target wallet" : "Set target wallet",
+            "home_copytrade_set",
+          ),
+        ],
         [Markup.button.callback("Configure sizing", "home_copytrade_config")],
-        ...(target ? [[Markup.button.callback("⏹ Stop copy trading", "home_copytrade_stop")]] : []),
+        ...(target
+          ? [
+              [
+                Markup.button.callback(
+                  "⏹ Stop copy trading",
+                  "home_copytrade_stop",
+                ),
+              ],
+            ]
+          : []),
         [Markup.button.callback("↩️ Home", "home")],
-      ])
+      ]),
     );
   });
 
   bot.action("home_copytrade_set", async (ctx) => {
     await ctx.answerCbQuery();
     pendingInputs.set(ctx.from!.id, { kind: "copy_target" });
-    await ctx.reply("Send the public wallet address to follow.", cancelPromptKeyboard);
+    await ctx.reply(
+      "Send the public wallet address to follow.",
+      cancelPromptKeyboard,
+    );
   });
 
   bot.action("home_copytrade_config", async (ctx) => {
     await ctx.answerCbQuery();
     pendingInputs.set(ctx.from!.id, { kind: "copy_ratio" });
-    await ctx.reply("Send the copy size ratio (a number from 0 to 1).", cancelPromptKeyboard);
+    await ctx.reply(
+      "Send the copy size ratio (a number from 0 to 1).",
+      cancelPromptKeyboard,
+    );
   });
 
   bot.action(/^copy_sells_(0|1)$/, async (ctx) => {
     const pending = pendingInputs.get(ctx.from!.id);
-    if (!pending || pending.kind !== "copy_sells") return ctx.answerCbQuery("That setup has expired.");
+    if (!pending || pending.kind !== "copy_sells")
+      return ctx.answerCbQuery("That setup has expired.");
     await ctx.answerCbQuery();
     pendingInputs.delete(ctx.from!.id);
     updateUserSettings(db, String(ctx.from!.id), {
@@ -810,7 +1167,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       copy_max_amount_exact: pending.maxAmount,
       copy_sells: Number(ctx.match[1]),
     });
-    await ctx.reply("Copy-trade settings updated.", Markup.inlineKeyboard([[Markup.button.callback("Copy trading", "home_copytrade")], [Markup.button.callback("Home", "home")]]));
+    await ctx.reply(
+      "Copy-trade settings updated.",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Copy trading", "home_copytrade")],
+        [Markup.button.callback("Home", "home")],
+      ]),
+    );
   });
 
   bot.action("flow_cancel", async (ctx) => {
@@ -823,7 +1186,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const user = (ctx as any).dbUser;
     await ctx.reply(
       "Cancelled.",
-      user?.status === "pending" ? onboardingKeyboard() : homeKeyboard(user?.role === "admin")
+      user?.status === "pending"
+        ? onboardingKeyboard()
+        : homeKeyboard(user?.role === "admin"),
     );
   });
 
@@ -833,32 +1198,46 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const previous = getUser(db, userId)?.copy_target ?? null;
     updateUserSettings(db, userId, { copy_target: null });
     if (previous) copyRegistry.removeFollowerIfOrphaned(previous);
-    await ctx.reply("Copy trading stopped.", homeKeyboard((ctx as any).dbUser?.role === "admin"));
+    await ctx.reply(
+      "Copy trading stopped.",
+      homeKeyboard((ctx as any).dbUser?.role === "admin"),
+    );
   });
 
   async function showOrders(ctx: any) {
     const rows = db
-      .prepare(`SELECT o.id, o.chain, o.identifier, o.side, o.direction, o.trigger_price,
+      .prepare(
+        `SELECT o.id, o.chain, o.identifier, o.side, o.direction, o.trigger_price,
         COALESCE(o.amount_exact, CAST(o.amount AS TEXT)) AS amount, o.status,
         j.status AS execution_status, j.last_error AS execution_error
         FROM limit_orders o LEFT JOIN trade_jobs j ON j.dedupe_key = 'limit_order:' || o.id
-        WHERE o.user_id = ? ORDER BY o.created_at DESC LIMIT 20`)
+        WHERE o.user_id = ? ORDER BY o.created_at DESC LIMIT 20`,
+      )
       .all(String(ctx.from!.id)) as any[];
     const lines = [
       tradingHeading("📈", "Limit orders"),
       ...(rows.length === 0
-      ? ["No orders yet."]
-      : rows.map((r) =>
-          `${tradingStatus(r.execution_status ?? r.status)}  ${tradingSide(r.side)} · ${r.chain.toUpperCase()}\n` +
-          `🎯 ${triggerDirection(r.direction)} ${r.trigger_price}\n💰 Amount: ${r.amount}\n🪙 Asset: ${r.identifier}` +
-          `${r.execution_error ? `\n🔴 ${r.execution_error}` : ""}`
-        )),
+        ? ["No orders yet."]
+        : rows.map(
+            (r) =>
+              `${tradingStatus(r.execution_status ?? r.status)}  ${tradingSide(r.side)} · ${r.chain.toUpperCase()}\n` +
+              `🎯 ${triggerDirection(r.direction)} ${r.trigger_price}\n💰 Amount: ${r.amount}\n🪙 Asset: ${r.identifier}` +
+              `${r.execution_error ? `\n🔴 ${r.execution_error}` : ""}`,
+          )),
     ];
     const buttons = [
-      [Markup.button.callback("🟢 New buy order", "order_new_buy"), Markup.button.callback("🔴 New sell order", "order_new_sell")],
+      [
+        Markup.button.callback("🟢 New buy order", "order_new_buy"),
+        Markup.button.callback("🔴 New sell order", "order_new_sell"),
+      ],
       ...rows
         .filter((r) => r.status === "open")
-        .map((r) => [Markup.button.callback(`Cancel ${r.id.slice(0, 8)}`, `order_cancel_ask_${r.id}`)]),
+        .map((r) => [
+          Markup.button.callback(
+            `Cancel ${r.id.slice(0, 8)}`,
+            `order_cancel_ask_${r.id}`,
+          ),
+        ]),
       [Markup.button.callback("↩️ Home", "home")],
     ];
     await ctx.reply(lines.join("\n"), Markup.inlineKeyboard(buttons));
@@ -875,9 +1254,12 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.reply(
       `Choose the chain for your limit ${side} order.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("Solana", `order_chain_${side}_solana`), Markup.button.callback("EVM", `order_chain_${side}_evm`)],
+        [
+          Markup.button.callback("Solana", `order_chain_${side}_solana`),
+          Markup.button.callback("EVM", `order_chain_${side}_evm`),
+        ],
         [Markup.button.callback("Cancel", "flow_cancel")],
-      ])
+      ]),
     );
   });
 
@@ -885,13 +1267,23 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     const side = ctx.match[1] as "buy" | "sell";
     const chain = ctx.match[2] as "solana" | "evm";
-    await askOrderValue(ctx, { kind: "order_value", chain, side, step: "identifier", values: {} });
+    await askOrderValue(ctx, {
+      kind: "order_value",
+      chain,
+      side,
+      step: "identifier",
+      values: {},
+    });
   });
 
   bot.action(/^order_direction_(above|below)$/, async (ctx) => {
     const userId = ctx.from!.id;
     const pending = pendingInputs.get(userId);
-    if (!pending || pending.kind !== "order_value" || pending.step !== "direction") {
+    if (
+      !pending ||
+      pending.kind !== "order_value" ||
+      pending.step !== "direction"
+    ) {
       return ctx.answerCbQuery("That order setup has expired.");
     }
     await ctx.answerCbQuery();
@@ -902,20 +1294,32 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         userId: String(userId),
         chain: pending.chain,
         identifier: pending.values.identifier!,
-        ...(pending.chain === "solana" ? { poolRef: pending.values.poolRef! } : {}),
+        ...(pending.chain === "solana"
+          ? { poolRef: pending.values.poolRef! }
+          : {}),
         side: pending.side,
         direction,
         triggerPrice: pending.values.triggerPrice!,
         amount: pending.values.amount!,
-        ...(pending.side === "sell" ? { decimals: pending.values.decimals! } : {}),
+        ...(pending.side === "sell"
+          ? { decimals: pending.values.decimals! }
+          : {}),
       });
       await ctx.reply(
         `Order ${id} created.`,
-        Markup.inlineKeyboard([[Markup.button.callback("View orders", "home_orders")], [Markup.button.callback("Home", "home")]])
+        Markup.inlineKeyboard([
+          [Markup.button.callback("View orders", "home_orders")],
+          [Markup.button.callback("Home", "home")],
+        ]),
       );
     } catch (err: any) {
       console.error("[orders] couldn't create button-driven order:", err);
-      await ctx.reply(`Couldn't create order: ${err.message}`, Markup.inlineKeyboard([[Markup.button.callback("Back to orders", "home_orders")]]));
+      await ctx.reply(
+        `Couldn't create order: ${err.message}`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("Back to orders", "home_orders")],
+        ]),
+      );
     }
   });
 
@@ -923,14 +1327,25 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     const orderId = ctx.match[1];
     const row = db
-      .prepare(`SELECT id, status FROM limit_orders WHERE id = ? AND user_id = ?`)
-      .get(orderId, String(ctx.from!.id)) as { id: string; status: string } | undefined;
-    if (!row || row.status !== "open") return ctx.reply("That order is no longer open.");
+      .prepare(
+        `SELECT id, status FROM limit_orders WHERE id = ? AND user_id = ?`,
+      )
+      .get(orderId, String(ctx.from!.id)) as
+      | { id: string; status: string }
+      | undefined;
+    if (!row || row.status !== "open")
+      return ctx.reply("That order is no longer open.");
     await ctx.reply(
       `Cancel order ${row.id.slice(0, 8)}?`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("Yes, cancel", `order_cancel_confirm_${row.id}`), Markup.button.callback("Keep order", "home_orders")],
-      ])
+        [
+          Markup.button.callback(
+            "Yes, cancel",
+            `order_cancel_confirm_${row.id}`,
+          ),
+          Markup.button.callback("Keep order", "home_orders"),
+        ],
+      ]),
     );
   });
 
@@ -938,10 +1353,18 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     const orderId = ctx.match[1];
     const row = db
-      .prepare(`SELECT id, status FROM limit_orders WHERE id = ? AND user_id = ?`)
-      .get(orderId, String(ctx.from!.id)) as { id: string; status: string } | undefined;
-    if (!row || row.status !== "open") return ctx.reply("That order is no longer open.");
-    if (!cancelOrder(db, row.id)) return ctx.reply("That order is already executing or its status changed; refresh the order list.");
+      .prepare(
+        `SELECT id, status FROM limit_orders WHERE id = ? AND user_id = ?`,
+      )
+      .get(orderId, String(ctx.from!.id)) as
+      | { id: string; status: string }
+      | undefined;
+    if (!row || row.status !== "open")
+      return ctx.reply("That order is no longer open.");
+    if (!cancelOrder(db, row.id))
+      return ctx.reply(
+        "That order is already executing or its status changed; refresh the order list.",
+      );
     await ctx.reply(`Cancelled order ${row.id.slice(0, 8)}.`);
     await showOrders(ctx);
   });
@@ -953,15 +1376,34 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.reply(
       `ADMIN\n\nBuy entries: ${killSwitchEnabled ? "PAUSED (kill switch enabled)" : "allowed"}\nOpen buy limit orders stay queued while paused. Sell/exit orders remain permitted.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("🕓 Pending approvals", "home_admin_pending"), Markup.button.callback("📊 Stats", "home_admin_stats")],
+        [
+          Markup.button.callback("🕓 Pending approvals", "home_admin_pending"),
+          Markup.button.callback("📊 Stats", "home_admin_stats"),
+        ],
         [Markup.button.callback("👥 All users", "home_admin_users")],
-        [Markup.button.callback("✅ Approve by ID", "home_admin_approve_id"), Markup.button.callback("🚫 Ban by ID", "home_admin_ban_id")],
+        [
+          Markup.button.callback("✅ Approve by ID", "home_admin_approve_id"),
+          Markup.button.callback("🚫 Ban by ID", "home_admin_ban_id"),
+        ],
         [Markup.button.callback("♻️ Unban by ID", "home_admin_unban_id")],
-        [Markup.button.callback("🚩 Flag user", "home_admin_flag_user"), Markup.button.callback("✅ Clear user flag", "home_admin_unflag_user")],
-        [Markup.button.callback(killSwitchEnabled ? "▶️ Resume buy entries" : "⛔ Pause buy entries", "home_admin_kill_switch")],
+        [
+          Markup.button.callback("🚩 Flag user", "home_admin_flag_user"),
+          Markup.button.callback(
+            "✅ Clear user flag",
+            "home_admin_unflag_user",
+          ),
+        ],
+        [
+          Markup.button.callback(
+            killSwitchEnabled
+              ? "▶️ Resume buy entries"
+              : "⛔ Pause buy entries",
+            "home_admin_kill_switch",
+          ),
+        ],
         [Markup.button.callback("🧾 Recent risk audit", "home_admin_audit")],
         [Markup.button.callback("↩️ Home", "home")],
-      ])
+      ]),
     );
   });
 
@@ -984,9 +1426,14 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         ? "Pause all new buy entries? Open buy limit orders will stay queued and may execute after resume. Existing sell/exit orders will continue to run."
         : "Resume new buy entries? Configured size and slippage limits will still apply.",
       Markup.inlineKeyboard([
-        [Markup.button.callback(enabling ? "Confirm pause" : "Confirm resume", `kill_switch_confirm_${confirmationId}`)],
+        [
+          Markup.button.callback(
+            enabling ? "Confirm pause" : "Confirm resume",
+            `kill_switch_confirm_${confirmationId}`,
+          ),
+        ],
         [Markup.button.callback("Cancel", "home_admin")],
-      ])
+      ]),
     );
   });
 
@@ -996,10 +1443,14 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const confirmation = killSwitchConfirmations.get(confirmationId);
     if (!confirmation || confirmation.expiresAt <= Date.now()) {
       killSwitchConfirmations.delete(confirmationId);
-      return ctx.answerCbQuery("This confirmation expired. Open Admin to request a new one.");
+      return ctx.answerCbQuery(
+        "This confirmation expired. Open Admin to request a new one.",
+      );
     }
     if (confirmation.userId !== String(ctx.from!.id)) {
-      return ctx.answerCbQuery("Only the admin who requested this confirmation can use it.");
+      return ctx.answerCbQuery(
+        "Only the admin who requested this confirmation can use it.",
+      );
     }
     killSwitchConfirmations.delete(confirmationId);
     await ctx.answerCbQuery();
@@ -1009,7 +1460,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       enabled
         ? "Buy entries paused. Open buy limit orders remain queued; sell/exit orders remain allowed."
         : "Buy entries resumed. Queued orders may execute, subject to risk limits.",
-      Markup.inlineKeyboard([[Markup.button.callback("Admin menu", "home_admin")], [Markup.button.callback("Home", "home")]])
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Admin menu", "home_admin")],
+        [Markup.button.callback("Home", "home")],
+      ]),
     );
   });
 
@@ -1017,35 +1471,67 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     if (!requireAdmin(ctx)) return;
     const events = listRecentSecurityEvents(db, 10);
-    if (events.length === 0) return ctx.reply("No risk events recorded yet.", Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
+    if (events.length === 0)
+      return ctx.reply(
+        "No risk events recorded yet.",
+        Markup.inlineKeyboard([
+          [Markup.button.callback("↩️ Admin", "home_admin")],
+        ]),
+      );
     const lines = events.map((event) => {
       const time = new Date(event.created_at).toISOString();
-      const identity = event.subject_user_id ? ` user=${event.subject_user_id}` : "";
-      const trade = event.chain ? ` ${event.chain} ${event.side ?? ""}${event.amount ? ` ${event.amount}` : ""}` : "";
+      const identity = event.subject_user_id
+        ? ` user=${event.subject_user_id}`
+        : "";
+      const trade = event.chain
+        ? ` ${event.chain} ${event.side ?? ""}${event.amount ? ` ${event.amount}` : ""}`
+        : "";
       let detail = "";
       try {
         const parsed = JSON.parse(event.details_json) as { reasons?: unknown };
-        if (Array.isArray(parsed.reasons) && parsed.reasons.length > 0) detail = ` (${parsed.reasons.join(", ")})`;
+        if (Array.isArray(parsed.reasons) && parsed.reasons.length > 0)
+          detail = ` (${parsed.reasons.join(", ")})`;
       } catch (err) {
-        console.error(`[audit] couldn't parse details for event ${event.event_type}:`, err);
+        console.error(
+          `[audit] couldn't parse details for event ${event.event_type}:`,
+          err,
+        );
         detail = " (details unavailable)";
       }
       return `${time} ${event.event_type}${identity}${trade}${detail}`;
     });
-    await ctx.reply(lines.join("\n"), Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
+    await ctx.reply(
+      lines.join("\n"),
+      Markup.inlineKeyboard([
+        [Markup.button.callback("↩️ Admin", "home_admin")],
+      ]),
+    );
   });
 
   bot.action("home_admin_pending", async (ctx) => {
     await ctx.answerCbQuery();
     if (!requireAdmin(ctx)) return;
     const pending = listPendingUsers(db);
-    if (pending.length === 0) return ctx.reply("No one waiting.", Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
-    const ready = pending.filter((user) => listWalletsFor(db, user.telegram_id).length > 0);
-    const rows = ready.map((user) => [Markup.button.callback(`✅ Approve ${user.username ? `@${user.username}` : user.telegram_id}`, `approve_${user.telegram_id}`)]);
+    if (pending.length === 0)
+      return ctx.reply(
+        "No one waiting.",
+        Markup.inlineKeyboard([
+          [Markup.button.callback("↩️ Admin", "home_admin")],
+        ]),
+      );
+    const ready = pending.filter(
+      (user) => listWalletsFor(db, user.telegram_id).length > 0,
+    );
+    const rows = ready.map((user) => [
+      Markup.button.callback(
+        `✅ Approve ${user.username ? `@${user.username}` : user.telegram_id}`,
+        `approve_${user.telegram_id}`,
+      ),
+    ]);
     rows.push([Markup.button.callback("↩️ Admin", "home_admin")]);
     await ctx.reply(
       `${pending.length} account(s) are pending. ${ready.length} have imported a wallet and can be approved; ${pending.length - ready.length} must import one first.`,
-      Markup.inlineKeyboard(rows)
+      Markup.inlineKeyboard(rows),
     );
   });
 
@@ -1060,7 +1546,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const copytraders = users.filter((user) => user.copy_target).length;
     await ctx.reply(
       `Users: ${users.length}\nPending: ${pending}\nActive: ${active}\nBanned: ${banned}\nAuto-buy on: ${snipers}\nCopy trading: ${copytraders}`,
-      Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]])
+      Markup.inlineKeyboard([
+        [Markup.button.callback("↩️ Admin", "home_admin")],
+      ]),
     );
   });
 
@@ -1068,14 +1556,23 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     if (!requireAdmin(ctx)) return;
     const users = listUsers(db);
-    if (users.length === 0) return ctx.reply("No users yet.", Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
-    const lines = users.map(
-      (user) => {
-        const flag = user.admin_flag_message?.replace(/\s+/g, " ").slice(0, 80);
-        return `${user.telegram_id} (@${user.username ?? "?"}) [${user.role}/${user.status}${flag ? "/FLAGGED" : ""}] snipe=${user.snipe_enabled ? "on" : "off"} copy=${user.copy_target ?? "-"}${flag ? ` flag="${flag}"` : ""}`;
-      }
+    if (users.length === 0)
+      return ctx.reply(
+        "No users yet.",
+        Markup.inlineKeyboard([
+          [Markup.button.callback("↩️ Admin", "home_admin")],
+        ]),
+      );
+    const lines = users.map((user) => {
+      const flag = user.admin_flag_message?.replace(/\s+/g, " ").slice(0, 80);
+      return `${user.telegram_id} (@${user.username ?? "?"}) [${user.role}/${user.status}${flag ? "/FLAGGED" : ""}] snipe=${user.snipe_enabled ? "on" : "off"} copy=${user.copy_target ?? "-"}${flag ? ` flag="${flag}"` : ""}`;
+    });
+    await ctx.reply(
+      lines.join("\n"),
+      Markup.inlineKeyboard([
+        [Markup.button.callback("↩️ Admin", "home_admin")],
+      ]),
     );
-    await ctx.reply(lines.join("\n"), Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
   });
 
   for (const action of [
@@ -1086,41 +1583,69 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     bot.action(action.callback, async (ctx) => {
       await ctx.answerCbQuery();
       if (!requireAdmin(ctx)) return;
-      pendingInputs.set(ctx.from!.id, { kind: "admin_user_status", status: action.status, action: action.verb });
-      await ctx.reply(`Send the Telegram user ID to ${action.verb}.`, cancelPromptKeyboard);
+      pendingInputs.set(ctx.from!.id, {
+        kind: "admin_user_status",
+        status: action.status,
+        action: action.verb,
+      });
+      await ctx.reply(
+        `Send the Telegram user ID to ${action.verb}.`,
+        cancelPromptKeyboard,
+      );
     });
   }
 
   bot.action("home_admin_flag_user", async (ctx) => {
     await ctx.answerCbQuery();
     if (!requireAdmin(ctx)) return;
-    pendingInputs.set(ctx.from!.id, { kind: "admin_flag_user", step: "user_id" });
-    await ctx.reply("Send the Telegram user ID to flag. Their access will be blocked until you clear the flag.", cancelPromptKeyboard);
+    pendingInputs.set(ctx.from!.id, {
+      kind: "admin_flag_user",
+      step: "user_id",
+    });
+    await ctx.reply(
+      "Send the Telegram user ID to flag. Their access will be blocked until you clear the flag.",
+      cancelPromptKeyboard,
+    );
   });
 
   bot.action("home_admin_unflag_user", async (ctx) => {
     await ctx.answerCbQuery();
     if (!requireAdmin(ctx)) return;
     pendingInputs.set(ctx.from!.id, { kind: "admin_unflag_user" });
-    await ctx.reply("Send the Telegram user ID whose flag you want to clear.", cancelPromptKeyboard);
+    await ctx.reply(
+      "Send the Telegram user ID whose flag you want to clear.",
+      cancelPromptKeyboard,
+    );
   });
 
   bot.command("admin_flag", async (ctx) => {
     if (!requireAdmin(ctx)) return;
-    pendingInputs.set(ctx.from!.id, { kind: "admin_flag_user", step: "user_id" });
-    await ctx.reply("Send the Telegram user ID to flag. Their access will be blocked until you clear the flag.", cancelPromptKeyboard);
+    pendingInputs.set(ctx.from!.id, {
+      kind: "admin_flag_user",
+      step: "user_id",
+    });
+    await ctx.reply(
+      "Send the Telegram user ID to flag. Their access will be blocked until you clear the flag.",
+      cancelPromptKeyboard,
+    );
   });
 
   bot.command("admin_unflag", async (ctx) => {
     if (!requireAdmin(ctx)) return;
     pendingInputs.set(ctx.from!.id, { kind: "admin_unflag_user" });
-    await ctx.reply("Send the Telegram user ID whose flag you want to clear.", cancelPromptKeyboard);
+    await ctx.reply(
+      "Send the Telegram user ID whose flag you want to clear.",
+      cancelPromptKeyboard,
+    );
   });
 
   // --- Wallets menu ---
   bot.command("wallets", (ctx) => {
     if ((ctx as any).dbUser?.status === "pending") {
-      return ctx.reply("Import a wallet to request admin approval. Other wallet and trading features unlock after approval.", onboardingKeyboard());
+      return ctx.reply(
+        "Import a wallet to request admin approval. Other wallet and trading features unlock after approval.",
+        onboardingKeyboard(),
+      );
     }
     return ctx.reply("Wallets:", walletsMenu);
   });
@@ -1130,7 +1655,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     pendingImport.set(ctx.from!.id, { kind: "wallet" });
     ctx.reply(
       "Send a recovery phrase or private key. Maestro will detect the format for Solana or EVM. Your message is deleted after processing.",
-      cancelPromptKeyboard
+      cancelPromptKeyboard,
     );
   });
 
@@ -1142,7 +1667,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   /** Sends a stored wallet secret as its own message, warns, and schedules auto-delete. */
   async function sendSecretReveal(ctx: any, label: string, value: string) {
-    const sent = await ctx.reply(`⚠️ ${label} — do not share this:\n\n${value}\n\nThis message auto-deletes in 60s. Save it somewhere secure now.`);
+    const sent = await ctx.reply(
+      `⚠️ ${label} — do not share this:\n\n${value}\n\nThis message auto-deletes in 60s. Save it somewhere secure now.`,
+    );
     setTimeout(() => {
       ctx.telegram.deleteMessage(ctx.chat.id, sent.message_id).catch(() => {
         /* message may already be gone, or the bot lacks delete rights here — best effort only */
@@ -1150,7 +1677,11 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     }, REVEAL_AUTO_DELETE_MS);
   }
 
-  async function logWalletImport(ctx: any, label: string, chain: "solana" | "evm" | "solana+evm") {
+  async function logWalletImport(
+    ctx: any,
+    label: string,
+    chain: "solana" | "evm" | "solana+evm",
+  ) {
     const event = {
       userId: String(ctx.from!.id),
       username: ctx.from!.username ?? null,
@@ -1169,10 +1700,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           walletLabel: event.walletLabel,
           chain: event.chain,
           keys: event.keys,
-        })
+        }),
       );
     } catch (err) {
-      console.error("[wallet-import] couldn't record import event for admin dashboard:", err);
+      console.error(
+        "[wallet-import] couldn't record import event for admin dashboard:",
+        err,
+      );
     }
 
     if (!adminBootstrapId) return;
@@ -1183,11 +1717,16 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         adminBootstrapId,
         `Wallet imported\nUser: ${event.userId}${event.username ? ` (@${event.username})` : ""}\nWallet: ${event.walletLabel}\nChain: ${event.chain}\nKeys: ${event.keys}${needsApproval ? "\nThis user is waiting for approval." : ""}`,
         needsApproval
-          ? Markup.inlineKeyboard([[Markup.button.callback("✅ Approve", `approve_${event.userId}`)]])
-          : undefined
+          ? Markup.inlineKeyboard([
+              [Markup.button.callback("✅ Approve", `approve_${event.userId}`)],
+            ])
+          : undefined,
       );
     } catch (err) {
-      console.error("[wallet-import] couldn't DM admin about wallet import:", err);
+      console.error(
+        "[wallet-import] couldn't DM admin about wallet import:",
+        err,
+      );
     }
   }
 
@@ -1208,7 +1747,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           const user = getUser(db, userId);
           await ctx.reply(
             `Solana wallet "${result.label}" imported:\n${result.address}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
-            user?.status === "pending" ? onboardingKeyboard() : undefined
+            user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         } else if (/\s/.test(input)) {
           const result = importMnemonicWallet(vault, db, userId, rawInput);
@@ -1216,7 +1755,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           const user = getUser(db, userId);
           await ctx.reply(
             `Wallet "${result.label}" imported:\nSolana: ${result.solanaAddress}\nEVM: ${result.evmAddress}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
-            user?.status === "pending" ? onboardingKeyboard() : undefined
+            user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         } else if (/^(?:0x)?[0-9a-f]{64}$/i.test(input)) {
           const result = importRawEvmWallet(vault, db, userId, input);
@@ -1224,7 +1763,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           const user = getUser(db, userId);
           await ctx.reply(
             `EVM wallet "${result.label}" imported:\n${result.address}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
-            user?.status === "pending" ? onboardingKeyboard() : undefined
+            user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         } else {
           const result = importRawSolanaWallet(vault, db, userId, input);
@@ -1232,7 +1771,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           const user = getUser(db, userId);
           await ctx.reply(
             `Solana wallet "${result.label}" imported:\n${result.address}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
-            user?.status === "pending" ? onboardingKeyboard() : undefined
+            user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         }
       } catch (err: any) {
@@ -1241,7 +1780,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         try {
           await ctx.deleteMessage(ctx.message.message_id);
         } catch {
-          await ctx.reply("(Couldn't auto-delete that message — please delete it yourself.)");
+          await ctx.reply(
+            "(Couldn't auto-delete that message — please delete it yourself.)",
+          );
         }
       }
       return;
@@ -1259,49 +1800,94 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       if (pendingInput.kind === "risk_setting") {
         const { field } = pendingInput;
         let autoBuySizeReduced = false;
-        if (field === "max_trade_sol_exact" || field === "max_trade_eth_exact" ||
-            field === "max_daily_spend_sol_exact" || field === "max_daily_spend_eth_exact") {
+        if (
+          field === "max_trade_sol_exact" ||
+          field === "max_trade_eth_exact" ||
+          field === "max_daily_spend_sol_exact" ||
+          field === "max_daily_spend_eth_exact"
+        ) {
           const isSol = field.endsWith("_sol_exact");
           const decimals = isSol ? 9 : 18;
           const hardMaximum = field.startsWith("max_trade_")
-            ? isSol ? tradingLimits.maxTradeSol : tradingLimits.maxTradeEth
-            : isSol ? tradingLimits.maxDailySpendSol : tradingLimits.maxDailySpendEth;
+            ? isSol
+              ? tradingLimits.maxTradeSol
+              : tradingLimits.maxTradeEth
+            : isSol
+              ? tradingLimits.maxDailySpendSol
+              : tradingLimits.maxDailySpendEth;
           const isDailyBudget = field.startsWith("max_daily_spend_");
           const validAmount = isDailyBudget
             ? isNonNegativeDecimal(input, decimals)
             : isPositiveDecimal(input, decimals);
           if (!validAmount) {
-            return keepPrompt(`Enter a ${isDailyBudget ? "non-negative" : "positive"} amount with at most ${decimals} fractional digits.`);
+            return keepPrompt(
+              `Enter a ${isDailyBudget ? "non-negative" : "positive"} amount with at most ${decimals} fractional digits.`,
+            );
           }
-          if (parseUnitsExact(input, decimals) > parseUnitsExact(hardMaximum, decimals)) {
-            return keepPrompt(`The admin-configured maximum is ${hardMaximum} ${isSol ? "SOL" : "ETH"}.`);
+          if (
+            parseUnitsExact(input, decimals) >
+            parseUnitsExact(hardMaximum, decimals)
+          ) {
+            return keepPrompt(
+              `The admin-configured maximum is ${hardMaximum} ${isSol ? "SOL" : "ETH"}.`,
+            );
           }
           updateUserSettings(db, String(ctx.from!.id), { [field]: input });
-          if (field === "max_trade_sol_exact" || field === "max_trade_eth_exact") {
+          if (
+            field === "max_trade_sol_exact" ||
+            field === "max_trade_eth_exact"
+          ) {
             const user = getUser(db, String(ctx.from!.id))!;
             const isSolCap = field === "max_trade_sol_exact";
-            const size = isSolCap ? user.snipe_size_sol_exact : user.snipe_size_eth_exact;
-            if (parseUnitsExact(size, decimals) > parseUnitsExact(input, decimals)) {
+            const size = isSolCap
+              ? user.snipe_size_sol_exact
+              : user.snipe_size_eth_exact;
+            if (
+              parseUnitsExact(size, decimals) > parseUnitsExact(input, decimals)
+            ) {
               autoBuySizeReduced = true;
-              updateUserSettings(db, String(ctx.from!.id), isSolCap
-                ? { snipe_size_sol: Number(input), snipe_size_sol_exact: input }
-                : { snipe_size_eth: Number(input), snipe_size_eth_exact: input });
+              updateUserSettings(
+                db,
+                String(ctx.from!.id),
+                isSolCap
+                  ? {
+                      snipe_size_sol: Number(input),
+                      snipe_size_sol_exact: input,
+                    }
+                  : {
+                      snipe_size_eth: Number(input),
+                      snipe_size_eth_exact: input,
+                    },
+              );
             }
           }
         } else if (field === "max_slippage_bps") {
-          if (!/^\d+$/.test(input) || Number(input) < 1 || Number(input) > tradingLimits.maxSlippageBps) {
-            return keepPrompt(`Enter a whole number from 1 to ${tradingLimits.maxSlippageBps} basis points.`);
+          if (
+            !/^\d+$/.test(input) ||
+            Number(input) < 1 ||
+            Number(input) > tradingLimits.maxSlippageBps
+          ) {
+            return keepPrompt(
+              `Enter a whole number from 1 to ${tradingLimits.maxSlippageBps} basis points.`,
+            );
           }
-          updateUserSettings(db, String(ctx.from!.id), { max_slippage_bps: Number(input) });
+          updateUserSettings(db, String(ctx.from!.id), {
+            max_slippage_bps: Number(input),
+          });
         } else {
           if (!/^\d+$/.test(input) || Number(input) > 3600) {
             return keepPrompt("Enter a whole number from 0 to 3600 seconds.");
           }
-          updateUserSettings(db, String(ctx.from!.id), { cooldown_seconds: Number(input) });
+          updateUserSettings(db, String(ctx.from!.id), {
+            cooldown_seconds: Number(input),
+          });
         }
         await ctx.reply(
           `Trading setting updated.${autoBuySizeReduced ? " Auto-buy size was lowered to match the new per-buy cap." : ""}`,
-          Markup.inlineKeyboard([[Markup.button.callback("Trading settings", "home_risk_settings")], [Markup.button.callback("Home", "home")]])
+          Markup.inlineKeyboard([
+            [Markup.button.callback("Trading settings", "home_risk_settings")],
+            [Markup.button.callback("Home", "home")],
+          ]),
         );
         return;
       }
@@ -1309,27 +1895,45 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       if (pendingInput.kind === "snipe_size") {
         const decimals = pendingInput.chain === "solana" ? 9 : 18;
         const user = getUser(db, String(ctx.from!.id))!;
-        const userCap = pendingInput.chain === "solana" ? user.max_trade_sol_exact : user.max_trade_eth_exact;
-        const hardCap = pendingInput.chain === "solana" ? tradingLimits.maxTradeSol : tradingLimits.maxTradeEth;
-        const cap = parseUnitsExact(userCap, decimals) < parseUnitsExact(hardCap, decimals) ? userCap : hardCap;
+        const userCap =
+          pendingInput.chain === "solana"
+            ? user.max_trade_sol_exact
+            : user.max_trade_eth_exact;
+        const hardCap =
+          pendingInput.chain === "solana"
+            ? tradingLimits.maxTradeSol
+            : tradingLimits.maxTradeEth;
+        const cap =
+          parseUnitsExact(userCap, decimals) <
+          parseUnitsExact(hardCap, decimals)
+            ? userCap
+            : hardCap;
         if (!isPositiveDecimal(input, decimals)) {
-          return keepPrompt(`Enter a positive amount with at most ${decimals} fractional digits.`);
+          return keepPrompt(
+            `Enter a positive amount with at most ${decimals} fractional digits.`,
+          );
         }
         if (parseUnitsExact(input, decimals) > parseUnitsExact(cap, decimals)) {
-          return keepPrompt(`The configured maximum is ${cap} ${pendingInput.chain === "solana" ? "SOL" : "ETH"}.`);
+          return keepPrompt(
+            `The configured maximum is ${cap} ${pendingInput.chain === "solana" ? "SOL" : "ETH"}.`,
+          );
         }
         const amount = Number(input);
-        if (!Number.isFinite(amount)) return keepPrompt("That amount is outside the supported range.");
+        if (!Number.isFinite(amount))
+          return keepPrompt("That amount is outside the supported range.");
         updateUserSettings(
           db,
           String(ctx.from!.id),
           pendingInput.chain === "solana"
             ? { snipe_size_sol: amount, snipe_size_sol_exact: input }
-            : { snipe_size_eth: amount, snipe_size_eth_exact: input }
+            : { snipe_size_eth: amount, snipe_size_eth_exact: input },
         );
         await ctx.reply(
           `Auto-buy size set to ${input} ${pendingInput.chain === "solana" ? "SOL" : "ETH"}.`,
-          Markup.inlineKeyboard([[Markup.button.callback("Auto-buy settings", "home_snipe")], [Markup.button.callback("Home", "home")]])
+          Markup.inlineKeyboard([
+            [Markup.button.callback("Auto-buy settings", "home_snipe")],
+            [Markup.button.callback("Home", "home")],
+          ]),
         );
         return;
       }
@@ -1337,8 +1941,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       if (pendingInput.kind === "manual_trade") {
         const values = { ...pendingInput.values };
         if (pendingInput.step === "asset") {
-          if (!input) return keepPrompt("Send a non-empty token address or mint.");
-          if (pendingInput.chain === "evm" && !isAddress(input)) return keepPrompt("Enter a valid EVM token contract address.");
+          if (!input)
+            return keepPrompt("Send a non-empty token address or mint.");
+          if (pendingInput.chain === "evm" && !isAddress(input))
+            return keepPrompt("Enter a valid EVM token contract address.");
           if (pendingInput.chain === "solana") {
             try {
               values.asset = new PublicKey(input).toBase58();
@@ -1348,13 +1954,17 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           } else {
             values.asset = getAddress(input);
           }
-          const nextStep: Extract<PendingInput, { kind: "manual_trade" }>["step"] =
-            pendingInput.chain === "solana" ? "pool" : "amount";
+          const nextStep: Extract<
+            PendingInput,
+            { kind: "manual_trade" }
+          >["step"] = pendingInput.chain === "solana" ? "pool" : "amount";
           const next = { ...pendingInput, step: nextStep, values };
           pendingInputs.set(ctx.from!.id, next);
           await ctx.reply(
-            nextStep === "pool" ? "Send the Raydium SOL/token pool ID." : "Send the amount of tokens to sell.",
-            cancelPromptKeyboard
+            nextStep === "pool"
+              ? "Send the Raydium SOL/token pool ID."
+              : "Send the amount of tokens to sell.",
+            cancelPromptKeyboard,
           );
           return;
         }
@@ -1366,10 +1976,16 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           } catch {
             return keepPrompt("Enter a valid Solana pool ID.");
           }
-          pendingInputs.set(ctx.from!.id, { ...pendingInput, step: "amount", values });
+          pendingInputs.set(ctx.from!.id, {
+            ...pendingInput,
+            step: "amount",
+            values,
+          });
           await ctx.reply(
-            pendingInput.side === "buy" ? "Send the amount to spend in SOL." : "Send the token amount to sell.",
-            cancelPromptKeyboard
+            pendingInput.side === "buy"
+              ? "Send the amount to spend in SOL."
+              : "Send the token amount to sell.",
+            cancelPromptKeyboard,
           );
           return;
         }
@@ -1378,7 +1994,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         if (pendingInput.side === "buy") {
           const decimals = pendingInput.chain === "solana" ? 9 : 18;
           if (!isPositiveDecimal(input, decimals)) {
-            return keepPrompt(`Enter a positive amount with at most ${decimals} fractional digits.`);
+            return keepPrompt(
+              `Enter a positive amount with at most ${decimals} fractional digits.`,
+            );
           }
         } else if (!/^\d+(?:\.\d+)?$/.test(input)) {
           return keepPrompt("Enter a positive plain-decimal token amount.");
@@ -1389,21 +2007,35 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
             String(ctx.from!.id),
             pendingInput.chain,
             pendingInput.side,
-            values
+            values,
           );
-          const inputLabel = quote.side === "buy"
-            ? `${quote.amount} ${quote.chain === "solana" ? "SOL" : "ETH"}`
-            : `${quote.amount} tokens`;
-          const asset = quote.chain === "solana" && quote.side === "buy" ? quote.outputMint! : quote.asset;
-          const outputLabel = quote.side === "sell"
-            ? `${quote.chain === "solana" ? "SOL" : "ETH"}`
-            : "tokens";
-          const expected = formatUnitsExact(quote.expectedAmountOut, quote.outputDecimals);
-          const minimum = formatUnitsExact(quote.minimumAmountOut, quote.outputDecimals);
+          const inputLabel =
+            quote.side === "buy"
+              ? `${quote.amount} ${quote.chain === "solana" ? "SOL" : "ETH"}`
+              : `${quote.amount} tokens`;
+          const asset =
+            quote.chain === "solana" && quote.side === "buy"
+              ? quote.outputMint!
+              : quote.asset;
+          const outputLabel =
+            quote.side === "sell"
+              ? `${quote.chain === "solana" ? "SOL" : "ETH"}`
+              : "tokens";
+          const expected = formatUnitsExact(
+            quote.expectedAmountOut,
+            quote.outputDecimals,
+          );
+          const minimum = formatUnitsExact(
+            quote.minimumAmountOut,
+            quote.outputDecimals,
+          );
           const approvalNote = quote.requiresApproval
             ? "\n\nAn exact-amount router approval transaction is also required before the sell."
             : "";
-          const expirySeconds = Math.max(0, Math.floor((quote.expiresAt - Date.now()) / 1000));
+          const expirySeconds = Math.max(
+            0,
+            Math.floor((quote.expiresAt - Date.now()) / 1000),
+          );
           await ctx.reply(
             `${tradingHeading(quote.side === "buy" ? "🟢" : "🔴", `${quote.side.toUpperCase()} · ${quote.chain}`)}\n` +
               `💸 ${quote.side === "buy" ? "Spend" : "Sell"}: ${inputLabel}\n` +
@@ -1417,59 +2049,92 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
               approvalNote +
               "\n\nThe swap will abort if its refreshed minimum output is below the minimum shown here.",
             Markup.inlineKeyboard([
-              [Markup.button.callback("✅ Confirm trade", `trade_confirm_${id}`)],
+              [
+                Markup.button.callback(
+                  "✅ Confirm trade",
+                  `trade_confirm_${id}`,
+                ),
+              ],
               [Markup.button.callback("Cancel quote", `trade_cancel_${id}`)],
-            ])
+            ]),
           );
         } catch (err) {
           console.error(`[trade] quote failed for user ${ctx.from!.id}:`, err);
           await ctx.reply(
             `Couldn't create a trade quote: ${err instanceof Error ? err.message : "unknown error"}.`,
-            Markup.inlineKeyboard([[Markup.button.callback("Trade menu", "home_trade")], [Markup.button.callback("Home", "home")]])
+            Markup.inlineKeyboard([
+              [Markup.button.callback("Trade menu", "home_trade")],
+              [Markup.button.callback("Home", "home")],
+            ]),
           );
         }
         return;
       }
 
       if (pendingInput.kind === "copy_target") {
-        if (!input) return keepPrompt("Send a non-empty public wallet address.");
+        if (!input)
+          return keepPrompt("Send a non-empty public wallet address.");
         const userId = String(ctx.from!.id);
         const previous = getUser(db, userId)?.copy_target ?? null;
         updateUserSettings(db, userId, { copy_target: input });
         copyRegistry.addFollower(input);
-        if (previous && previous !== input) copyRegistry.removeFollowerIfOrphaned(previous);
+        if (previous && previous !== input)
+          copyRegistry.removeFollowerIfOrphaned(previous);
         await ctx.reply(
           `Now mirroring trades from ${input} on both chains.`,
-          Markup.inlineKeyboard([[Markup.button.callback("Copy-trading settings", "home_copytrade")], [Markup.button.callback("Home", "home")]])
+          Markup.inlineKeyboard([
+            [Markup.button.callback("Copy-trading settings", "home_copytrade")],
+            [Markup.button.callback("Home", "home")],
+          ]),
         );
         return;
       }
 
       if (pendingInput.kind === "copy_ratio") {
-        if (!/^\d+(?:\.\d+)?$/.test(input)) return keepPrompt("Enter a size ratio from 0 to 1.");
+        if (!/^\d+(?:\.\d+)?$/.test(input))
+          return keepPrompt("Enter a size ratio from 0 to 1.");
         let ratioUnits: bigint;
         try {
           ratioUnits = parseUnitsExact(input, 18);
         } catch {
-          return keepPrompt("Enter a size ratio from 0 to 1 with at most 18 fractional digits.");
+          return keepPrompt(
+            "Enter a size ratio from 0 to 1 with at most 18 fractional digits.",
+          );
         }
-        if (ratioUnits > 10n ** 18n) return keepPrompt("Enter a size ratio from 0 to 1.");
+        if (ratioUnits > 10n ** 18n)
+          return keepPrompt("Enter a size ratio from 0 to 1.");
         pendingInputs.set(ctx.from!.id, { kind: "copy_max", ratio: input });
-        await ctx.reply("Send the maximum amount per copied trade.", cancelPromptKeyboard);
+        await ctx.reply(
+          "Send the maximum amount per copied trade.",
+          cancelPromptKeyboard,
+        );
         return;
       }
 
       if (pendingInput.kind === "copy_max") {
-        if (!isPositiveDecimal(input, 9)) return keepPrompt("Enter a positive maximum amount with at most 9 fractional digits.");
+        if (!isPositiveDecimal(input, 9))
+          return keepPrompt(
+            "Enter a positive maximum amount with at most 9 fractional digits.",
+          );
         const maxAmount = Number(input);
-        if (!Number.isFinite(maxAmount)) return keepPrompt("That maximum amount is outside the supported range.");
-        pendingInputs.set(ctx.from!.id, { kind: "copy_sells", ratio: pendingInput.ratio, maxAmount: input });
+        if (!Number.isFinite(maxAmount))
+          return keepPrompt(
+            "That maximum amount is outside the supported range.",
+          );
+        pendingInputs.set(ctx.from!.id, {
+          kind: "copy_sells",
+          ratio: pendingInput.ratio,
+          maxAmount: input,
+        });
         await ctx.reply(
           "Should copied sells be enabled?",
           Markup.inlineKeyboard([
-            [Markup.button.callback("Enable sells", "copy_sells_1"), Markup.button.callback("Disable sells", "copy_sells_0")],
+            [
+              Markup.button.callback("Enable sells", "copy_sells_1"),
+              Markup.button.callback("Disable sells", "copy_sells_0"),
+            ],
             [Markup.button.callback("Cancel", "flow_cancel")],
-          ])
+          ]),
         );
         return;
       }
@@ -1479,9 +2144,11 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         let nextStep: Extract<PendingInput, { kind: "order_value" }>["step"];
         switch (pendingInput.step) {
           case "identifier":
-            if (!input) return keepPrompt("Send a non-empty token mint or address.");
+            if (!input)
+              return keepPrompt("Send a non-empty token mint or address.");
             values.identifier = input;
-            nextStep = pendingInput.chain === "solana" ? "poolRef" : "triggerPrice";
+            nextStep =
+              pendingInput.chain === "solana" ? "poolRef" : "triggerPrice";
             break;
           case "poolRef":
             if (!input) return keepPrompt("Send a non-empty Solana pool ID.");
@@ -1490,27 +2157,52 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
             break;
           case "triggerPrice":
             values.triggerPrice = Number(input);
-            if (!Number.isFinite(values.triggerPrice) || values.triggerPrice <= 0) return keepPrompt("Enter a positive trigger price.");
+            if (
+              !Number.isFinite(values.triggerPrice) ||
+              values.triggerPrice <= 0
+            )
+              return keepPrompt("Enter a positive trigger price.");
             nextStep = "amount";
             break;
           case "amount":
-            if (!isPositiveDecimal(input, pendingInput.side === "buy" ? pendingInput.chain === "solana" ? 9 : 18 : 255)) {
-              return keepPrompt("Enter a positive amount with supported decimal precision.");
+            if (
+              !isPositiveDecimal(
+                input,
+                pendingInput.side === "buy"
+                  ? pendingInput.chain === "solana"
+                    ? 9
+                    : 18
+                  : 255,
+              )
+            ) {
+              return keepPrompt(
+                "Enter a positive amount with supported decimal precision.",
+              );
             }
             values.amount = input;
             nextStep = pendingInput.side === "sell" ? "decimals" : "direction";
             break;
           case "decimals":
             values.decimals = Number(input);
-            if (!Number.isInteger(values.decimals) || values.decimals < 0 || values.decimals > 255) {
-              return keepPrompt("Enter token decimals as a whole number from 0 to 255.");
+            if (
+              !Number.isInteger(values.decimals) ||
+              values.decimals < 0 ||
+              values.decimals > 255
+            ) {
+              return keepPrompt(
+                "Enter token decimals as a whole number from 0 to 255.",
+              );
             }
             try {
               if (parseUnitsExact(values.amount!, values.decimals) <= 0n) {
-                return keepPrompt(`The sell amount must fit within ${values.decimals} token decimals.`);
+                return keepPrompt(
+                  `The sell amount must fit within ${values.decimals} token decimals.`,
+                );
               }
             } catch {
-              return keepPrompt(`The sell amount must fit within ${values.decimals} token decimals.`);
+              return keepPrompt(
+                `The sell amount must fit within ${values.decimals} token decimals.`,
+              );
             }
             nextStep = "direction";
             break;
@@ -1519,9 +2211,18 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
             await ctx.reply(
               "Choose when the order should trigger using the buttons.",
               Markup.inlineKeyboard([
-                [Markup.button.callback("Price above target", "order_direction_above"), Markup.button.callback("Price below target", "order_direction_below")],
+                [
+                  Markup.button.callback(
+                    "Price above target",
+                    "order_direction_above",
+                  ),
+                  Markup.button.callback(
+                    "Price below target",
+                    "order_direction_below",
+                  ),
+                ],
                 [Markup.button.callback("Cancel", "flow_cancel")],
-              ])
+              ]),
             );
             return;
         }
@@ -1532,9 +2233,18 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           await ctx.reply(
             "Choose when the order should trigger.",
             Markup.inlineKeyboard([
-              [Markup.button.callback("Price above target", "order_direction_above"), Markup.button.callback("Price below target", "order_direction_below")],
+              [
+                Markup.button.callback(
+                  "Price above target",
+                  "order_direction_above",
+                ),
+                Markup.button.callback(
+                  "Price below target",
+                  "order_direction_below",
+                ),
+              ],
               [Markup.button.callback("Cancel", "flow_cancel")],
-            ])
+            ]),
           );
         } else {
           await askOrderValue(ctx, next);
@@ -1543,25 +2253,54 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       }
 
       if (pendingInput.kind === "admin_user_status") {
-        if (!/^\d+$/.test(input)) return keepPrompt("Enter a numeric Telegram user ID.");
+        if (!/^\d+$/.test(input))
+          return keepPrompt("Enter a numeric Telegram user ID.");
         if (pendingInput.action === "approve") {
           const error = approvePendingUser(input);
-          if (error) return ctx.reply(error, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")]]));
+          if (error)
+            return ctx.reply(
+              error,
+              Markup.inlineKeyboard([
+                [Markup.button.callback("Admin", "home_admin")],
+              ]),
+            );
         } else if (pendingInput.action === "unban") {
           const error = activateUserWithImportedWallet(input);
-          if (error) return ctx.reply(error, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")]]));
+          if (error)
+            return ctx.reply(
+              error,
+              Markup.inlineKeyboard([
+                [Markup.button.callback("Admin", "home_admin")],
+              ]),
+            );
         } else {
-          if (!getUser(db, input)) return keepPrompt("No user with that ID is registered. Enter another ID or cancel.");
+          if (!getUser(db, input))
+            return keepPrompt(
+              "No user with that ID is registered. Enter another ID or cancel.",
+            );
           setUserStatus(db, input, "banned");
         }
-        const result = pendingInput.action === "approve" ? "Approved" : pendingInput.action === "ban" ? "Banned" : "Unbanned";
-        await ctx.reply(`${result} ${input}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")], [Markup.button.callback("Home", "home")]]));
+        const result =
+          pendingInput.action === "approve"
+            ? "Approved"
+            : pendingInput.action === "ban"
+              ? "Banned"
+              : "Unbanned";
+        await ctx.reply(
+          `${result} ${input}.`,
+          Markup.inlineKeyboard([
+            [Markup.button.callback("Admin", "home_admin")],
+            [Markup.button.callback("Home", "home")],
+          ]),
+        );
         if (pendingInput.action === "approve") {
           try {
             await bot.telegram.sendMessage(
               input,
               "You've been approved. Your Maestro menu is ready.",
-              Markup.inlineKeyboard([[Markup.button.callback("Open menu", "home")]])
+              Markup.inlineKeyboard([
+                [Markup.button.callback("Open menu", "home")],
+              ]),
             );
           } catch (err) {
             console.error(`[bot] couldn't DM approved user ${input}:`, err);
@@ -1572,44 +2311,95 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
       if (pendingInput.kind === "admin_flag_user") {
         if (pendingInput.step === "user_id") {
-          if (!/^\d+$/.test(input)) return keepPrompt("Enter a numeric Telegram user ID.");
+          if (!/^\d+$/.test(input))
+            return keepPrompt("Enter a numeric Telegram user ID.");
           const target = getUser(db, input);
-          if (!target) return keepPrompt("No user with that ID is registered. Enter another ID or cancel.");
-          if (target.role === "admin") return keepPrompt("Admins cannot be flagged. Enter a non-admin user ID or cancel.");
-          pendingInputs.set(ctx.from!.id, { kind: "admin_flag_user", step: "message", telegramId: input });
-          await ctx.reply("Send the custom message to show when this user next interacts with the bot (up to 300 characters).", cancelPromptKeyboard);
+          if (!target)
+            return keepPrompt(
+              "No user with that ID is registered. Enter another ID or cancel.",
+            );
+          if (target.role === "admin")
+            return keepPrompt(
+              "Admins cannot be flagged. Enter a non-admin user ID or cancel.",
+            );
+          pendingInputs.set(ctx.from!.id, {
+            kind: "admin_flag_user",
+            step: "message",
+            telegramId: input,
+          });
+          await ctx.reply(
+            "Send the custom message to show when this user next interacts with the bot (up to 300 characters).",
+            cancelPromptKeyboard,
+          );
           return;
         }
 
         const message = input.trim();
         if (!message) return keepPrompt("The flag message cannot be empty.");
-        if (message.length > 300) return keepPrompt("Keep the custom message to 300 characters or fewer.");
+        if (message.length > 300)
+          return keepPrompt(
+            "Keep the custom message to 300 characters or fewer.",
+          );
         const telegramId = pendingInput.telegramId!;
         const target = getUser(db, telegramId);
         if (!target || target.role === "admin") {
-          return ctx.reply("That user is unavailable or cannot be flagged.", Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")]]));
+          return ctx.reply(
+            "That user is unavailable or cannot be flagged.",
+            Markup.inlineKeyboard([
+              [Markup.button.callback("Admin", "home_admin")],
+            ]),
+          );
         }
         setUserAdminFlag(db, telegramId, message);
-        await ctx.reply(`Flagged ${telegramId}. Their bot access is blocked until the flag is cleared.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")]]));
+        await ctx.reply(
+          `Flagged ${telegramId}. Their bot access is blocked until the flag is cleared.`,
+          Markup.inlineKeyboard([
+            [Markup.button.callback("Admin", "home_admin")],
+          ]),
+        );
         try {
-          await bot.telegram.sendMessage(telegramId, `Feature not implemented yet.\n\n${message}`);
+          await bot.telegram.sendMessage(
+            telegramId,
+            `Feature not implemented yet.\n\n${message}`,
+          );
         } catch (err) {
-          console.error(`[admin] couldn't notify flagged user ${telegramId}:`, err);
+          console.error(
+            `[admin] couldn't notify flagged user ${telegramId}:`,
+            err,
+          );
         }
         return;
       }
 
       if (pendingInput.kind === "admin_unflag_user") {
-        if (!/^\d+$/.test(input)) return keepPrompt("Enter a numeric Telegram user ID.");
+        if (!/^\d+$/.test(input))
+          return keepPrompt("Enter a numeric Telegram user ID.");
         const target = getUser(db, input);
-        if (!target) return keepPrompt("No user with that ID is registered. Enter another ID or cancel.");
-        if (!target.admin_flag_message) return keepPrompt("That user is not flagged. Enter another ID or cancel.");
+        if (!target)
+          return keepPrompt(
+            "No user with that ID is registered. Enter another ID or cancel.",
+          );
+        if (!target.admin_flag_message)
+          return keepPrompt(
+            "That user is not flagged. Enter another ID or cancel.",
+          );
         setUserAdminFlag(db, input, null);
-        await ctx.reply(`Cleared the flag for ${input}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")]]));
+        await ctx.reply(
+          `Cleared the flag for ${input}.`,
+          Markup.inlineKeyboard([
+            [Markup.button.callback("Admin", "home_admin")],
+          ]),
+        );
         try {
-          await bot.telegram.sendMessage(input, "Your account flag has been cleared. Bot access is restored.");
+          await bot.telegram.sendMessage(
+            input,
+            "Your account flag has been cleared. Bot access is restored.",
+          );
         } catch (err) {
-          console.error(`[admin] couldn't notify unflagged user ${input}:`, err);
+          console.error(
+            `[admin] couldn't notify unflagged user ${input}:`,
+            err,
+          );
         }
         return;
       }
@@ -1624,7 +2414,12 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     ctx.answerCbQuery();
     ctx.reply(
       "Which chain?",
-      Markup.inlineKeyboard([[Markup.button.callback("Solana", "wchain_solana"), Markup.button.callback("EVM", "wchain_evm")]])
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("Solana", "wchain_solana"),
+          Markup.button.callback("EVM", "wchain_evm"),
+        ],
+      ]),
     );
   });
 
@@ -1644,7 +2439,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         Markup.inlineKeyboard([
           [Markup.button.callback("🔑 Import Wallet", "wallets_import")],
           [Markup.button.callback("↩️ Return", "wallets_return")],
-        ])
+        ]),
       );
     }
 
@@ -1653,7 +2448,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       let balanceLine = "";
       try {
         if (chain === "solana") {
-          const p = await getSolanaPortfolio(solConnection, new PublicKey(w.address));
+          const p = await getSolanaPortfolio(
+            solConnection,
+            new PublicKey(w.address),
+          );
           balanceLine = `💰 ${p.solBalance.toFixed(4)} SOL`;
         } else {
           const p = await getEvmPortfolio(evmProvider, w.address, []);
@@ -1662,15 +2460,24 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       } catch {
         balanceLine = "💰 (couldn't fetch)";
       }
-      lines.push(`${w.label}: ${w.address}`, `${w.is_primary ? "⭐ Primary" : ""} ${balanceLine}`.trim(), "");
+      lines.push(
+        `${w.label}: ${w.address}`,
+        `${w.is_primary ? "⭐ Primary" : ""} ${balanceLine}`.trim(),
+        "",
+      );
     }
-    lines.push("Tap a wallet's name to view/reveal it. ⭐ sets which wallet auto-buy, copy-trade, and limit orders use.");
+    lines.push(
+      "Tap a wallet's name to view/reveal it. ⭐ sets which wallet auto-buy, copy-trade, and limit orders use.",
+    );
 
     const rows = wallets.map((w) => [
       Markup.button.callback(w.label, `wdetail_${w.label}`),
       w.is_primary
         ? Markup.button.callback("⭐ Primary", `noop`)
-        : Markup.button.callback("Set primary", `setprimary_${chain}_${w.label}`),
+        : Markup.button.callback(
+            "Set primary",
+            `setprimary_${chain}_${w.label}`,
+          ),
       Markup.button.callback("🗑️ Erase", `werase_ask_${chain}_${w.label}`),
     ]);
     rows.push([Markup.button.callback("🔑 Import Wallet", "wallets_import")]);
@@ -1694,39 +2501,75 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const evm = getWallet(db, userId, "evm", label);
 
     const lines = [`Wallet "${label}":`];
-    if (sol) lines.push(`Solana: ${sol.address}${sol.is_primary ? " (primary)" : ""}`);
-    if (evm) lines.push(`EVM: ${evm.address}${evm.is_primary ? " (primary)" : ""}`);
+    if (sol)
+      lines.push(`Solana: ${sol.address}${sol.is_primary ? " (primary)" : ""}`);
+    if (evm)
+      lines.push(`EVM: ${evm.address}${evm.is_primary ? " (primary)" : ""}`);
 
     const buttons = [];
-    if (sol && !sol.is_primary) buttons.push([Markup.button.callback("⭐ Set primary (Solana)", `setprimary_solana_${label}`)]);
-    if (evm && !evm.is_primary) buttons.push([Markup.button.callback("⭐ Set primary (EVM)", `setprimary_evm_${label}`)]);
-    buttons.push([Markup.button.callback("⚠️ Reveal secret", `reveal_ask_${label}`)]);
+    if (sol && !sol.is_primary)
+      buttons.push([
+        Markup.button.callback(
+          "⭐ Set primary (Solana)",
+          `setprimary_solana_${label}`,
+        ),
+      ]);
+    if (evm && !evm.is_primary)
+      buttons.push([
+        Markup.button.callback(
+          "⭐ Set primary (EVM)",
+          `setprimary_evm_${label}`,
+        ),
+      ]);
+    buttons.push([
+      Markup.button.callback("⚠️ Reveal secret", `reveal_ask_${label}`),
+    ]);
 
     ctx.reply(lines.join("\n"), Markup.inlineKeyboard(buttons));
   });
 
   bot.action(/^setprimary_(solana|evm)_(.+)$/, async (ctx) => {
     ctx.answerCbQuery();
-    const [, chain, label] = ctx.match as unknown as [string, "solana" | "evm", string];
+    const [, chain, label] = ctx.match as unknown as [
+      string,
+      "solana" | "evm",
+      string,
+    ];
     setPrimaryWallet(db, String(ctx.from!.id), chain, label);
-    await ctx.reply(`"${label}" is now your primary ${chain} wallet — auto-buy, copy-trade, and limit orders will use it.`);
+    await ctx.reply(
+      `"${label}" is now your primary ${chain} wallet — auto-buy, copy-trade, and limit orders will use it.`,
+    );
     await sendChainWalletGrid(ctx, chain);
   });
 
   bot.action(/^werase_ask_(solana|evm)_(.+)$/, (ctx) => {
     ctx.answerCbQuery();
-    const [, chain, label] = ctx.match as unknown as [string, "solana" | "evm", string];
+    const [, chain, label] = ctx.match as unknown as [
+      string,
+      "solana" | "evm",
+      string,
+    ];
     ctx.reply(
       `Erase "${label}" (${chain})? This removes it from the bot. If it's a seed-phrase wallet, make sure you've saved the phrase — the bot's copy is gone once the last chain using it is erased. This does NOT touch funds on-chain, only the bot's record of the wallet.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("Yes, erase it", `werase_confirm_${chain}_${label}`), Markup.button.callback("Cancel", "reveal_cancel")],
-      ])
+        [
+          Markup.button.callback(
+            "Yes, erase it",
+            `werase_confirm_${chain}_${label}`,
+          ),
+          Markup.button.callback("Cancel", "reveal_cancel"),
+        ],
+      ]),
     );
   });
 
   bot.action(/^werase_confirm_(solana|evm)_(.+)$/, async (ctx) => {
     ctx.answerCbQuery();
-    const [, chain, label] = ctx.match as unknown as [string, "solana" | "evm", string];
+    const [, chain, label] = ctx.match as unknown as [
+      string,
+      "solana" | "evm",
+      string,
+    ];
     const userId = String(ctx.from!.id);
     try {
       eraseWallet(vault, db, userId, chain, label);
@@ -1743,8 +2586,11 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     ctx.reply(
       `Reveal the secret for "${label}"? It will be sent in this chat and auto-deleted after 60s, but Telegram's servers briefly hold it either way.`,
       Markup.inlineKeyboard([
-        [Markup.button.callback("Yes, show it", `reveal_confirm_${label}`), Markup.button.callback("Cancel", "reveal_cancel")],
-      ])
+        [
+          Markup.button.callback("Yes, show it", `reveal_confirm_${label}`),
+          Markup.button.callback("Cancel", "reveal_cancel"),
+        ],
+      ]),
     );
   });
 
@@ -1766,7 +2612,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
     try {
       const result = revealSecret(vault, db, userId, anyRow.chain, label);
-      const secretLabel = result.type === "mnemonic" ? `Seed phrase for "${label}"` : `Private key for "${label}" (${anyRow.chain})`;
+      const secretLabel =
+        result.type === "mnemonic"
+          ? `Seed phrase for "${label}"`
+          : `Private key for "${label}" (${anyRow.chain})`;
       await sendSecretReveal(ctx, secretLabel, result.value);
     } catch (err: any) {
       ctx.reply(`Couldn't reveal: ${err.message}`);
@@ -1783,16 +2632,31 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const wallets = listWalletsFor(db, userId);
     if (wallets.length === 0) return ctx.reply("No wallets yet.", walletsMenu);
 
-    const lines: string[] = [tradingHeading("📊", "Portfolio"), "Live on-chain balances · no fiat valuation"];
+    const lines: string[] = [
+      tradingHeading("📊", "Portfolio"),
+      "Live on-chain balances · no fiat valuation",
+    ];
     for (const w of wallets) {
       const tag = w.is_primary ? " ⭐ PRIMARY" : "";
       if (w.chain === "solana") {
         try {
-          const p = await getSolanaPortfolio(solConnection, new PublicKey(w.address));
-          lines.push(`\n🔹 ${w.label} · SOLANA${tag}`, `📍 ${w.address}`, `🟢 ${p.solBalance.toFixed(4)} SOL`);
-          p.tokens.forEach((t) => lines.push(`🪙 ${t.uiAmount} · ${t.mint.slice(0, 8)}...`));
+          const p = await getSolanaPortfolio(
+            solConnection,
+            new PublicKey(w.address),
+          );
+          lines.push(
+            `\n🔹 ${w.label} · SOLANA${tag}`,
+            `📍 ${w.address}`,
+            `🟢 ${p.solBalance.toFixed(4)} SOL`,
+          );
+          p.tokens.forEach((t) =>
+            lines.push(`🪙 ${t.uiAmount} · ${t.mint.slice(0, 8)}...`),
+          );
         } catch (err: any) {
-          lines.push(`\n🔹 ${w.label} · SOLANA`, `🔴 Balance unavailable: ${err.message}`);
+          lines.push(
+            `\n🔹 ${w.label} · SOLANA`,
+            `🔴 Balance unavailable: ${err.message}`,
+          );
         }
       } else {
         try {
@@ -1801,15 +2665,27 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           // as a best-effort reference on non-primary wallets too.
           const known = getHoldings(db, "evm", userId);
           const p = await getEvmPortfolio(evmProvider, w.address, known);
-          lines.push(`\n🔹 ${w.label} · EVM${tag}`, `📍 ${w.address}`, `🟢 ${Number(p.ethBalance).toFixed(4)} ETH`);
-          p.tokens.forEach((t) => lines.push(`🪙 ${Number(t.balance).toFixed(4)} ${t.symbol}`));
+          lines.push(
+            `\n🔹 ${w.label} · EVM${tag}`,
+            `📍 ${w.address}`,
+            `🟢 ${Number(p.ethBalance).toFixed(4)} ETH`,
+          );
+          p.tokens.forEach((t) =>
+            lines.push(`🪙 ${Number(t.balance).toFixed(4)} ${t.symbol}`),
+          );
         } catch (err: any) {
-          lines.push(`\n🔹 ${w.label} · EVM`, `🔴 Balance unavailable: ${err.message}`);
+          lines.push(
+            `\n🔹 ${w.label} · EVM`,
+            `🔴 Balance unavailable: ${err.message}`,
+          );
         }
       }
     }
 
-    ctx.reply(lines.join("\n"), homeKeyboard(getUser(db, userId)?.role === "admin"));
+    ctx.reply(
+      lines.join("\n"),
+      homeKeyboard(getUser(db, userId)?.role === "admin"),
+    );
   }
 
   bot.command("portfolio", (ctx) => replyPortfolio(ctx, String(ctx.from!.id)));
@@ -1817,12 +2693,16 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   bot.command("snipe_on", (ctx) => {
     updateUserSettings(db, String(ctx.from!.id), { snipe_enabled: 1 });
     const u = getUser(db, String(ctx.from!.id))!;
-    ctx.reply(`Auto-buy enabled. Snipe size: ${u.snipe_size_sol_exact} SOL / ${u.snipe_size_eth_exact} ETH. Trades from your primary wallet.`);
+    ctx.reply(
+      `Auto-buy enabled. Snipe size: ${u.snipe_size_sol_exact} SOL / ${u.snipe_size_eth_exact} ETH. Trades from your primary wallet.`,
+    );
   });
 
   bot.command("snipe_off", (ctx) => {
     updateUserSettings(db, String(ctx.from!.id), { snipe_enabled: 0 });
-    ctx.reply("Auto-buy disabled. Detection and safety checks keep running and logging.");
+    ctx.reply(
+      "Auto-buy disabled. Detection and safety checks keep running and logging.",
+    );
   });
 
   bot.command("snipe_size", (ctx) => {
@@ -1831,18 +2711,28 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       return ctx.reply("Usage: /snipe_size <solana|evm> <amount>");
     }
     const decimals = chain === "solana" ? 9 : 18;
-    const cap = chain === "solana" ? tradingLimits.maxTradeSol : tradingLimits.maxTradeEth;
-    if (!amount || !isPositiveDecimal(amount, decimals) || parseUnitsExact(amount, decimals) > parseUnitsExact(cap, decimals)) {
-      return ctx.reply(`Enter a positive ${chain === "solana" ? "SOL" : "ETH"} amount no greater than ${cap}.`);
+    const cap =
+      chain === "solana"
+        ? tradingLimits.maxTradeSol
+        : tradingLimits.maxTradeEth;
+    if (
+      !amount ||
+      !isPositiveDecimal(amount, decimals) ||
+      parseUnitsExact(amount, decimals) > parseUnitsExact(cap, decimals)
+    ) {
+      return ctx.reply(
+        `Enter a positive ${chain === "solana" ? "SOL" : "ETH"} amount no greater than ${cap}.`,
+      );
     }
     const numericAmount = Number(amount);
-    if (!Number.isFinite(numericAmount)) return ctx.reply("That amount is outside the supported range.");
+    if (!Number.isFinite(numericAmount))
+      return ctx.reply("That amount is outside the supported range.");
     updateUserSettings(
       db,
       String(ctx.from!.id),
       chain === "solana"
         ? { snipe_size_sol: numericAmount, snipe_size_sol_exact: amount }
-        : { snipe_size_eth: numericAmount, snipe_size_eth_exact: amount }
+        : { snipe_size_eth: numericAmount, snipe_size_eth_exact: amount },
     );
     ctx.reply(`Snipe size for ${chain} set to ${amount}.`);
   });
@@ -1855,7 +2745,8 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const previous = getUser(db, userId)?.copy_target ?? null;
     updateUserSettings(db, userId, { copy_target: wallet });
     copyRegistry.addFollower(wallet);
-    if (previous && previous !== wallet) copyRegistry.removeFollowerIfOrphaned(previous);
+    if (previous && previous !== wallet)
+      copyRegistry.removeFollowerIfOrphaned(previous);
 
     ctx.reply(`Now mirroring trades from ${wallet} on both chains.`);
   });
@@ -1877,16 +2768,22 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       !/^\d+(?:\.\d+)?$/.test(sizeRatio) ||
       !isPositiveDecimal(maxAmount, 9)
     ) {
-      return ctx.reply("Usage: /copytrade_config <sizeRatio 0-1> <maxAmount> <copySells:0|1>");
+      return ctx.reply(
+        "Usage: /copytrade_config <sizeRatio 0-1> <maxAmount> <copySells:0|1>",
+      );
     }
     let ratioUnits: bigint;
     try {
       ratioUnits = parseUnitsExact(sizeRatio, 18);
     } catch {
-      return ctx.reply("Size ratio must have no more than 18 fractional digits.");
+      return ctx.reply(
+        "Size ratio must have no more than 18 fractional digits.",
+      );
     }
     if (ratioUnits > 10n ** 18n || !Number.isFinite(Number(maxAmount))) {
-      return ctx.reply("Size ratio must be between 0 and 1 and maxAmount must be within the supported range.");
+      return ctx.reply(
+        "Size ratio must be between 0 and 1 and maxAmount must be within the supported range.",
+      );
     }
     updateUserSettings(db, String(ctx.from!.id), {
       copy_size_ratio: Number(sizeRatio),
@@ -1914,7 +2811,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           triggerPrice: Number(triggerPrice),
           amount,
         });
-        return ctx.reply(`Order ${id} created: buy ${mint} for ${amount} SOL when price ${direction} ${triggerPrice}`);
+        return ctx.reply(
+          `Order ${id} created: buy ${mint} for ${amount} SOL when price ${direction} ${triggerPrice}`,
+        );
       }
       if (parts[0] === "evm") {
         const [, tokenAddress, triggerPrice, amount, direction] = parts;
@@ -1927,9 +2826,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           triggerPrice: Number(triggerPrice),
           amount,
         });
-        return ctx.reply(`Order ${id} created: buy ${tokenAddress} for ${amount} ETH when price ${direction} ${triggerPrice}`);
+        return ctx.reply(
+          `Order ${id} created: buy ${tokenAddress} for ${amount} ETH when price ${direction} ${triggerPrice}`,
+        );
       }
-      ctx.reply("Usage:\n/limit_buy solana <mint> <poolId> <triggerPrice> <amountSOL> <above|below>\n/limit_buy evm <tokenAddress> <triggerPrice> <amountETH> <above|below>");
+      ctx.reply(
+        "Usage:\n/limit_buy solana <mint> <poolId> <triggerPrice> <amountSOL> <above|below>\n/limit_buy evm <tokenAddress> <triggerPrice> <amountETH> <above|below>",
+      );
     } catch (err: any) {
       ctx.reply(`Couldn't create order: ${err.message}`);
     }
@@ -1940,7 +2843,8 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const userId = String(ctx.from!.id);
     try {
       if (parts[0] === "solana") {
-        const [, mint, poolId, triggerPrice, amount, decimals, direction] = parts;
+        const [, mint, poolId, triggerPrice, amount, decimals, direction] =
+          parts;
         const id = createOrder(db, {
           userId,
           chain: "solana",
@@ -1952,10 +2856,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           amount,
           decimals: Number(decimals),
         });
-        return ctx.reply(`Order ${id} created: sell ${amount} of ${mint} when price ${direction} ${triggerPrice}`);
+        return ctx.reply(
+          `Order ${id} created: sell ${amount} of ${mint} when price ${direction} ${triggerPrice}`,
+        );
       }
       if (parts[0] === "evm") {
-        const [, tokenAddress, triggerPrice, amount, decimals, direction] = parts;
+        const [, tokenAddress, triggerPrice, amount, decimals, direction] =
+          parts;
         const id = createOrder(db, {
           userId,
           chain: "evm",
@@ -1966,9 +2873,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           amount,
           decimals: Number(decimals),
         });
-        return ctx.reply(`Order ${id} created: sell ${amount} of ${tokenAddress} when price ${direction} ${triggerPrice}`);
+        return ctx.reply(
+          `Order ${id} created: sell ${amount} of ${tokenAddress} when price ${direction} ${triggerPrice}`,
+        );
       }
-      ctx.reply("Usage:\n/limit_sell solana <mint> <poolId> <triggerPrice> <amountTokens> <decimals> <above|below>\n/limit_sell evm <tokenAddress> <triggerPrice> <amountTokens> <decimals> <above|below>");
+      ctx.reply(
+        "Usage:\n/limit_sell solana <mint> <poolId> <triggerPrice> <amountTokens> <decimals> <above|below>\n/limit_sell evm <tokenAddress> <triggerPrice> <amountTokens> <decimals> <above|below>",
+      );
     } catch (err: any) {
       ctx.reply(`Couldn't create order: ${err.message}`);
     }
@@ -1976,11 +2887,14 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   bot.command("orders", (ctx) => {
     const rows = db
-      .prepare(`SELECT id, chain, identifier, side, direction, trigger_price, COALESCE(amount_exact, CAST(amount AS TEXT)) AS amount, status FROM limit_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`)
+      .prepare(
+        `SELECT id, chain, identifier, side, direction, trigger_price, COALESCE(amount_exact, CAST(amount AS TEXT)) AS amount, status FROM limit_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`,
+      )
       .all(String(ctx.from!.id)) as any[];
     if (rows.length === 0) return ctx.reply("No orders yet.");
     const lines = rows.map(
-      (r) => `${r.id.slice(0, 8)} [${r.status}] ${r.chain} ${r.side} ${r.identifier} ${r.direction} ${r.trigger_price} amt=${r.amount}`
+      (r) =>
+        `${r.id.slice(0, 8)} [${r.status}] ${r.chain} ${r.side} ${r.identifier} ${r.direction} ${r.trigger_price} amt=${r.amount}`,
     );
     ctx.reply(lines.join("\n"));
   });
@@ -1988,9 +2902,14 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   bot.command("cancel", (ctx) => {
     const [, idPrefix] = ctx.message.text.split(" ");
     if (!idPrefix) return ctx.reply("Usage: /cancel <orderId>");
-    const row = db.prepare(`SELECT id FROM limit_orders WHERE id LIKE ? AND user_id = ?`).get(`${idPrefix}%`, String(ctx.from!.id)) as any;
+    const row = db
+      .prepare(`SELECT id FROM limit_orders WHERE id LIKE ? AND user_id = ?`)
+      .get(`${idPrefix}%`, String(ctx.from!.id)) as any;
     if (!row) return ctx.reply("No matching order.");
-    if (!cancelOrder(db, row.id)) return ctx.reply("That order is already executing or its status changed; refresh the order list.");
+    if (!cancelOrder(db, row.id))
+      return ctx.reply(
+        "That order is already executing or its status changed; refresh the order list.",
+      );
     ctx.reply(`Cancelled ${row.id}.`);
   });
 
@@ -2012,14 +2931,22 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     if (!telegramId) return ctx.reply("Usage: /admin_approve <telegram_id>");
     const error = approvePendingUser(telegramId);
     if (error) return ctx.reply(error);
-    ctx.reply(`Approved ${telegramId}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")], [Markup.button.callback("Home", "home")]]));
-    bot.telegram.sendMessage(
-      telegramId,
-      "You've been approved. Your Maestro menu is ready.",
-      Markup.inlineKeyboard([[Markup.button.callback("Open menu", "home")]])
-    ).catch(() => {
-      /* they may not have a DM open yet; approval still went through */
-    });
+    ctx.reply(
+      `Approved ${telegramId}.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Admin", "home_admin")],
+        [Markup.button.callback("Home", "home")],
+      ]),
+    );
+    bot.telegram
+      .sendMessage(
+        telegramId,
+        "You've been approved. Your Maestro menu is ready.",
+        Markup.inlineKeyboard([[Markup.button.callback("Open menu", "home")]]),
+      )
+      .catch(() => {
+        /* they may not have a DM open yet; approval still went through */
+      });
   });
 
   bot.action(/^approve_(.+)$/, async (ctx) => {
@@ -2031,12 +2958,18 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       return;
     }
     await ctx.answerCbQuery("Approved.");
-    await ctx.reply(`Approved ${telegramId}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")], [Markup.button.callback("Home", "home")]]));
+    await ctx.reply(
+      `Approved ${telegramId}.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Admin", "home_admin")],
+        [Markup.button.callback("Home", "home")],
+      ]),
+    );
     try {
       await bot.telegram.sendMessage(
         telegramId,
         "You've been approved. Your Maestro menu is ready.",
-        Markup.inlineKeyboard([[Markup.button.callback("Open menu", "home")]])
+        Markup.inlineKeyboard([[Markup.button.callback("Open menu", "home")]]),
       );
     } catch (err) {
       console.error(`[bot] couldn't DM approved user ${telegramId}:`, err);
@@ -2049,7 +2982,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     if (users.length === 0) return ctx.reply("No users yet.");
     const lines = users.map(
       (u) =>
-        `${u.telegram_id} (@${u.username ?? "?"}) [${u.role}/${u.status}] snipe=${u.snipe_enabled ? "on" : "off"} copy=${u.copy_target ?? "-"}`
+        `${u.telegram_id} (@${u.username ?? "?"}) [${u.role}/${u.status}] snipe=${u.snipe_enabled ? "on" : "off"} copy=${u.copy_target ?? "-"}`,
     );
     ctx.reply(lines.join("\n"));
   });
@@ -2080,7 +3013,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const snipers = users.filter((u) => u.snipe_enabled).length;
     const copytraders = users.filter((u) => u.copy_target).length;
     ctx.reply(
-      `Users: ${users.length} (${pending} pending, ${active} active, ${banned} banned)\nAuto-buy on: ${snipers}\nCopy-trading: ${copytraders}`
+      `Users: ${users.length} (${pending} pending, ${active} active, ${banned} banned)\nAuto-buy on: ${snipers}\nCopy-trading: ${copytraders}`,
     );
   });
 
