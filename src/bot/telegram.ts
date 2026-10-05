@@ -27,6 +27,7 @@ import {
   listUsers,
   listPendingUsers,
   setUserStatus,
+  setUserAdminFlag,
   setKillSwitch,
   updateUserSettings,
   listWalletsFor,
@@ -45,6 +46,43 @@ import { assertBuyEntryEnabled, evaluateTradePolicy } from "../risk/policy.js";
 import { formatUnitsExact } from "../shared/amount.js";
 import type { Wallet as EvmWallet } from "ethers";
 import { beginTrackedTrade } from "../transactions/tracker.js";
+
+const USER_COMMANDS = [
+  { command: "start", description: "Open the Maestro menu" },
+  { command: "help", description: "Show help" },
+  { command: "wallets", description: "Manage or import wallets" },
+  { command: "cancel_import", description: "Cancel wallet import" },
+  { command: "portfolio", description: "View portfolio balances" },
+  { command: "snipe_on", description: "Enable auto-buy" },
+  { command: "snipe_off", description: "Disable auto-buy" },
+  { command: "snipe_size", description: "Set auto-buy size" },
+  { command: "copytrade_set", description: "Set copy-trade target" },
+  { command: "copytrade_off", description: "Stop copy-trading" },
+  { command: "copytrade_config", description: "Configure copy-trade sizing" },
+  { command: "limit_buy", description: "Create a limit buy order" },
+  { command: "limit_sell", description: "Create a limit sell order" },
+  { command: "orders", description: "View open and recent orders" },
+  { command: "cancel", description: "Cancel a limit order" },
+];
+
+const ADMIN_COMMANDS = [
+  { command: "admin_pending", description: "List pending user approvals" },
+  { command: "admin_approve", description: "Approve a user by Telegram ID" },
+  { command: "admin_users", description: "List registered users" },
+  { command: "admin_ban", description: "Ban a user by Telegram ID" },
+  { command: "admin_unban", description: "Unban a user by Telegram ID" },
+  { command: "admin_stats", description: "Show user and trading stats" },
+  { command: "admin_flag", description: "Flag a user with a custom message" },
+  { command: "admin_unflag", description: "Clear a user's flag" },
+];
+
+export async function configureBotCommands(bot: Telegraf, adminId: string): Promise<void> {
+  await bot.telegram.setMyCommands(USER_COMMANDS);
+  await bot.telegram.setMyCommands(
+    [...USER_COMMANDS, ...ADMIN_COMMANDS],
+    { scope: { type: "chat", chat_id: adminId } }
+  );
+}
 
 export interface BotDeps {
   vault: WalletVault;
@@ -108,6 +146,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     );
   }
 
+  function adminFlagNotice(message: string): string {
+    return `Feature not implemented yet. ${message}`.slice(0, 200);
+  }
+
   async function notifyAdminOfPendingUser(user: { telegram_id: string; username: string | null }): Promise<void> {
     if (!adminBootstrapId) return;
     try {
@@ -136,6 +178,15 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       return ctx.reply("Your access to this bot has been revoked.");
     }
 
+    if (user.role !== "admin" && user.admin_flag_message) {
+      const notice = adminFlagNotice(user.admin_flag_message);
+      if (ctx.callbackQuery) {
+        await ctx.answerCbQuery(notice, { show_alert: true });
+        return;
+      }
+      return ctx.reply(`Feature not implemented yet.\n\n${user.admin_flag_message}`);
+    }
+
     if (user.status === "pending") {
       const text = (ctx.message as any)?.text as string | undefined;
       const command = text?.split(/\s/, 1)[0].split("@")[0];
@@ -147,13 +198,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       const isImportText = !!ctx.from && !!text && !text.startsWith("/") && pendingImport.has(ctx.from.id);
       if (!isOnboardingCommand && !isOnboardingAction && !isImportText) {
         if (ctx.callbackQuery) {
-          try {
-            await ctx.answerCbQuery("Import a wallet and wait for admin approval to unlock features.");
-          } catch {
-            /* ignore */
-          }
+          await ctx.answerCbQuery(
+            "Feature not implemented yet. Import a wallet and wait for admin approval.",
+            { show_alert: true }
+          );
+          return;
         }
-        return ctx.reply("Import a wallet first. Other features unlock after an admin approves your account.");
+        return ctx.reply("Feature not implemented yet. Import a wallet and wait for admin approval.");
       }
     }
 
@@ -212,7 +263,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         step: "identifier" | "poolRef" | "triggerPrice" | "amount" | "decimals" | "direction";
         values: OrderDraft;
       }
-    | { kind: "admin_user_status"; status: "active" | "banned"; action: "approve" | "ban" | "unban" };
+    | { kind: "admin_user_status"; status: "active" | "banned"; action: "approve" | "ban" | "unban" }
+    | { kind: "admin_flag_user"; step: "user_id" | "message"; telegramId?: string }
+    | { kind: "admin_unflag_user" };
 
   type ManualTradeQuote = {
     userId: string;
@@ -894,6 +947,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         [Markup.button.callback("👥 All users", "home_admin_users")],
         [Markup.button.callback("✅ Approve by ID", "home_admin_approve_id"), Markup.button.callback("🚫 Ban by ID", "home_admin_ban_id")],
         [Markup.button.callback("♻️ Unban by ID", "home_admin_unban_id")],
+        [Markup.button.callback("🚩 Flag user", "home_admin_flag_user"), Markup.button.callback("✅ Clear user flag", "home_admin_unflag_user")],
         [Markup.button.callback(killSwitchEnabled ? "▶️ Resume buy entries" : "⛔ Pause buy entries", "home_admin_kill_switch")],
         [Markup.button.callback("🧾 Recent risk audit", "home_admin_audit")],
         [Markup.button.callback("↩️ Home", "home")],
@@ -1006,8 +1060,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const users = listUsers(db);
     if (users.length === 0) return ctx.reply("No users yet.", Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
     const lines = users.map(
-      (user) =>
-        `${user.telegram_id} (@${user.username ?? "?"}) [${user.role}/${user.status}] snipe=${user.snipe_enabled ? "on" : "off"} copy=${user.copy_target ?? "-"}`
+      (user) => {
+        const flag = user.admin_flag_message?.replace(/\s+/g, " ").slice(0, 80);
+        return `${user.telegram_id} (@${user.username ?? "?"}) [${user.role}/${user.status}${flag ? "/FLAGGED" : ""}] snipe=${user.snipe_enabled ? "on" : "off"} copy=${user.copy_target ?? "-"}${flag ? ` flag="${flag}"` : ""}`;
+      }
     );
     await ctx.reply(lines.join("\n"), Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
   });
@@ -1024,6 +1080,32 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       await ctx.reply(`Send the Telegram user ID to ${action.verb}.`, cancelPromptKeyboard);
     });
   }
+
+  bot.action("home_admin_flag_user", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    pendingInputs.set(ctx.from!.id, { kind: "admin_flag_user", step: "user_id" });
+    await ctx.reply("Send the Telegram user ID to flag. Their access will be blocked until you clear the flag.", cancelPromptKeyboard);
+  });
+
+  bot.action("home_admin_unflag_user", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    pendingInputs.set(ctx.from!.id, { kind: "admin_unflag_user" });
+    await ctx.reply("Send the Telegram user ID whose flag you want to clear.", cancelPromptKeyboard);
+  });
+
+  bot.command("admin_flag", async (ctx) => {
+    if (!requireAdmin(ctx)) return;
+    pendingInputs.set(ctx.from!.id, { kind: "admin_flag_user", step: "user_id" });
+    await ctx.reply("Send the Telegram user ID to flag. Their access will be blocked until you clear the flag.", cancelPromptKeyboard);
+  });
+
+  bot.command("admin_unflag", async (ctx) => {
+    if (!requireAdmin(ctx)) return;
+    pendingInputs.set(ctx.from!.id, { kind: "admin_unflag_user" });
+    await ctx.reply("Send the Telegram user ID whose flag you want to clear.", cancelPromptKeyboard);
+  });
 
   // --- Wallets menu ---
   bot.command("wallets", (ctx) => {
@@ -1474,6 +1556,50 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           } catch (err) {
             console.error(`[bot] couldn't DM approved user ${input}:`, err);
           }
+        }
+        return;
+      }
+
+      if (pendingInput.kind === "admin_flag_user") {
+        if (pendingInput.step === "user_id") {
+          if (!/^\d+$/.test(input)) return keepPrompt("Enter a numeric Telegram user ID.");
+          const target = getUser(db, input);
+          if (!target) return keepPrompt("No user with that ID is registered. Enter another ID or cancel.");
+          if (target.role === "admin") return keepPrompt("Admins cannot be flagged. Enter a non-admin user ID or cancel.");
+          pendingInputs.set(ctx.from!.id, { kind: "admin_flag_user", step: "message", telegramId: input });
+          await ctx.reply("Send the custom message to show when this user next interacts with the bot (up to 300 characters).", cancelPromptKeyboard);
+          return;
+        }
+
+        const message = input.trim();
+        if (!message) return keepPrompt("The flag message cannot be empty.");
+        if (message.length > 300) return keepPrompt("Keep the custom message to 300 characters or fewer.");
+        const telegramId = pendingInput.telegramId!;
+        const target = getUser(db, telegramId);
+        if (!target || target.role === "admin") {
+          return ctx.reply("That user is unavailable or cannot be flagged.", Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")]]));
+        }
+        setUserAdminFlag(db, telegramId, message);
+        await ctx.reply(`Flagged ${telegramId}. Their bot access is blocked until the flag is cleared.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")]]));
+        try {
+          await bot.telegram.sendMessage(telegramId, `Feature not implemented yet.\n\n${message}`);
+        } catch (err) {
+          console.error(`[admin] couldn't notify flagged user ${telegramId}:`, err);
+        }
+        return;
+      }
+
+      if (pendingInput.kind === "admin_unflag_user") {
+        if (!/^\d+$/.test(input)) return keepPrompt("Enter a numeric Telegram user ID.");
+        const target = getUser(db, input);
+        if (!target) return keepPrompt("No user with that ID is registered. Enter another ID or cancel.");
+        if (!target.admin_flag_message) return keepPrompt("That user is not flagged. Enter another ID or cancel.");
+        setUserAdminFlag(db, input, null);
+        await ctx.reply(`Cleared the flag for ${input}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")]]));
+        try {
+          await bot.telegram.sendMessage(input, "Your account flag has been cleared. Bot access is restored.");
+        } catch (err) {
+          console.error(`[admin] couldn't notify unflagged user ${input}:`, err);
         }
         return;
       }

@@ -4,7 +4,7 @@ import { Wallet as EvmWallet } from "ethers";
 import { loadConfig } from "./config/env.js";
 import { WalletVault } from "./vault/wallet-vault.js";
 import { getPrimarySolanaKeypair, getPrimaryEvmWallet } from "./vault/walletHelpers.js";
-import { createBot } from "./bot/telegram.js";
+import { configureBotCommands, createBot } from "./bot/telegram.js";
 import { getSolanaConnection } from "./chains/solana/connection.js";
 import { startPoolListener } from "./chains/solana/poolListener.js";
 import { extractRaydiumPoolKeysFromTx, getPoolIdByMint } from "./chains/solana/poolKeys.js";
@@ -298,7 +298,7 @@ async function main() {
     },
     evmHttpProvider: evmHttp,
   });
-  await launchWithRetry(bot);
+  await launchWithRetry(bot, config.telegramOwnerId);
   console.log("maestro running.");
 }
 
@@ -309,9 +309,15 @@ async function main() {
  * entire process down along with every listener/engine already running.
  * Retries a few times with backoff before giving up for real.
  */
-async function launchWithRetry(bot: ReturnType<typeof createBot>, attempts = 5, delayMs = 3000): Promise<void> {
+async function launchWithRetry(
+  bot: ReturnType<typeof createBot>,
+  adminId: string,
+  attempts = 5,
+  delayMs = 3000
+): Promise<void> {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
+      await configureBotCommands(bot, adminId);
       await bot.launch();
       return;
     } catch (err) {

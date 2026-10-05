@@ -44,6 +44,10 @@ npm run dev
 
 Message your bot on Telegram — you're auto-registered on first contact. If your id matches `TELEGRAM_OWNER_ID` you're promoted to admin and auto-approved. Other users remain pending and can only import a wallet and view onboarding/help until an admin approves them. An admin can approve only after at least one wallet has been imported. Every trading and account feature stays unavailable until both steps are complete; see the operational checklist below.
 
+From the Telegram Admin menu, admins can flag a non-admin user with a custom message or clear that flag later. A flagged user's callback/button interactions show the flag message in a Telegram popup; text commands/messages receive it as a chat reply. Flagging blocks access until the admin clears it. Telegram popups require a user interaction, so the bot also sends the user a notification when the flag is set.
+
+The Telegram command menu lists available slash commands. Regular user commands are set as the default menu; the configured `TELEGRAM_OWNER_ID` receives the same commands plus admin commands, including `/admin_flag` and `/admin_unflag`. Flagging and clearing flags are also available as buttons in the Admin inline keyboard.
+
 ## Admin app
 
 Two extra pieces, both under `admin-server/` and `admin-web/`, sharing the bot's SQLite file — no separate database to stand up.
