@@ -3,38 +3,20 @@ import { Wallet as EvmWallet } from "ethers";
 import Database from "better-sqlite3";
 import bs58 from "bs58";
 import { WalletVault } from "./wallet-vault.js";
-import { generateMnemonicWallets, deriveFromMnemonic } from "./mnemonicWallet.js";
+import { deriveFromMnemonic } from "./mnemonicWallet.js";
 import { addWallet, getWallet, getPrimaryWallet, nextWalletLabel, deleteWallet, isLabelStillInUse } from "../db/db.js";
 
 export const OWNER_ID = "owner"; // fallback default for direct/test calls that don't specify a real user id
 
-export interface NewWalletResult {
+export interface MnemonicWalletImportResult {
   label: string;
   mnemonic: string;
   solanaAddress: string;
   evmAddress: string;
 }
 
-/**
- * Creates a brand-new wallet: one seed phrase backing both a Solana and an
- * EVM address (standard derivation paths — the same phrase would reproduce
- * these addresses in Phantom/MetaMask too). Inserts one `wallets` row per
- * chain sharing the label, since both are derived from — and reveal as —
- * the same underlying phrase.
- */
-export function createMnemonicWallet(vault: WalletVault, db: Database.Database, userId: string): NewWalletResult {
-  const derived = generateMnemonicWallets();
-  const label = nextWalletLabel(db, userId);
-
-  vault.storeSecret(userId, "mnemonic", label, derived.mnemonic);
-  addWallet(db, { userId, chain: "solana", label, address: derived.solana.publicKey, hasMnemonic: true });
-  addWallet(db, { userId, chain: "evm", label, address: derived.evm.address, hasMnemonic: true });
-
-  return { label, mnemonic: derived.mnemonic, solanaAddress: derived.solana.publicKey, evmAddress: derived.evm.address };
-}
-
-/** Imports a wallet from an existing seed phrase — same shared-label, both-chains shape as createMnemonicWallet. */
-export function importMnemonicWallet(vault: WalletVault, db: Database.Database, userId: string, mnemonicInput: string): NewWalletResult {
+/** Imports an existing seed phrase and derives its standard Solana and EVM addresses. */
+export function importMnemonicWallet(vault: WalletVault, db: Database.Database, userId: string, mnemonicInput: string): MnemonicWalletImportResult {
   const derived = deriveFromMnemonic(mnemonicInput); // throws on an invalid phrase
   const label = nextWalletLabel(db, userId);
 

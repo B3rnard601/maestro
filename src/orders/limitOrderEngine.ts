@@ -6,7 +6,11 @@ import { getSolanaPrice } from "../chains/solana/price.js";
 import { getEvmPrice } from "../chains/evm/price.js";
 import { executeBuy as executeSolanaBuy, executeSell as executeSolanaSell } from "../chains/solana/executor.js";
 import { executeBuy as executeEvmBuy, executeSell as executeEvmSell } from "../chains/evm/executor.js";
-import { recordHolding } from "../db/db.js";
+import { getSystemControls, recordHolding } from "../db/db.js";
+import type { AppConfig } from "../config/env.js";
+import { assertBuyEntryEnabled, evaluateTradePolicy } from "../risk/policy.js";
+import { parseUnitsExact } from "../shared/amount.js";
+import { beginTrackedTrade } from "../transactions/tracker.js";
 
 export interface LimitOrderInput {
   userId: string;
@@ -16,7 +20,7 @@ export interface LimitOrderInput {
   side: "buy" | "sell";
   direction: "above" | "below"; // fire when price crosses above/below trigger
   triggerPrice: number;
-  amount: number; // buy: native currency to spend (SOL/ETH). sell: token quantity, human units.
+  amount: string; // buy: native currency to spend (SOL/ETH). sell: token quantity, human units.
   decimals?: number; // required for sell orders — token decimals, to compute raw base units
 }
 
@@ -27,11 +31,23 @@ export function createOrder(db: Database.Database, order: LimitOrderInput): stri
   if (order.side === "sell" && order.decimals === undefined) {
     throw new Error("Sell orders require decimals to convert amount into raw token base units");
   }
+  if (!Number.isFinite(order.triggerPrice) || order.triggerPrice <= 0) {
+    throw new Error("Trigger price must be a positive finite number.");
+  }
+  const amountUnits = parseUnitsExact(
+    order.amount,
+    order.side === "sell" ? order.decimals! : order.chain === "solana" ? 9 : 18
+  );
+  if (amountUnits <= 0n) throw new Error("Order amount must be greater than zero.");
+  if (!Number.isFinite(Number(order.amount))) throw new Error("Order amount is outside the supported range.");
+  if (order.side === "sell" && (!Number.isInteger(order.decimals) || order.decimals! < 0 || order.decimals! > 255)) {
+    throw new Error("Sell order decimals must be an integer from 0 to 255.");
+  }
   const id = randomUUID();
   db.prepare(
     `INSERT INTO limit_orders
-     (id, user_id, chain, identifier, pool_ref, side, direction, trigger_price, amount, decimals, status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`
+     (id, user_id, chain, identifier, pool_ref, side, direction, trigger_price, amount, amount_exact, decimals, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)`
   ).run(
     id,
     order.userId,
@@ -41,6 +57,7 @@ export function createOrder(db: Database.Database, order: LimitOrderInput): stri
     order.side,
     order.direction,
     order.triggerPrice,
+    Number(order.amount),
     order.amount,
     order.decimals ?? null,
     Date.now()
@@ -64,8 +81,8 @@ function crossed(direction: "above" | "below", price: number, trigger: number): 
   return direction === "above" ? price >= trigger : price <= trigger;
 }
 
-function toBaseUnits(amount: number, decimals: number): bigint {
-  return BigInt(Math.floor(amount * 10 ** decimals));
+function toBaseUnits(amount: string, decimals: number): bigint {
+  return parseUnitsExact(amount, decimals);
 }
 
 export interface EngineDeps {
@@ -75,6 +92,7 @@ export interface EngineDeps {
   evmProvider: JsonRpcProvider;
   loadEvmWallet: (userId: string) => EvmWallet | null;
   evmFactoryAddress: string;
+  config: AppConfig;
   pollIntervalMs?: number;
 }
 
@@ -88,15 +106,18 @@ export interface EngineDeps {
  * wallet now that multiple people's orders share this table.
  */
 export function startLimitOrderEngine(deps: EngineDeps) {
-  const { db, solConnection, loadSolWallet, evmProvider, loadEvmWallet, evmFactoryAddress } = deps;
+  const { db, solConnection, loadSolWallet, evmProvider, loadEvmWallet, evmFactoryAddress, config } = deps;
   const pollIntervalMs = deps.pollIntervalMs ?? 5_000;
+  const auditedBlockedOrders = new Set<string>();
 
   const interval = setInterval(async () => {
     const orders = getOpenOrders(db);
     if (orders.length === 0) return;
 
     for (const order of orders) {
+      let lifecycle: ReturnType<typeof beginTrackedTrade> | undefined;
       try {
+        const amount = order.amount_exact ?? String(order.amount);
         const solWallet = order.chain === "solana" ? loadSolWallet(order.user_id) : null;
         const evmWallet = order.chain === "evm" ? loadEvmWallet(order.user_id) : null;
 
@@ -109,6 +130,9 @@ export function startLimitOrderEngine(deps: EngineDeps) {
           continue;
         }
 
+        if (order.side === "buy" && auditedBlockedOrders.has(order.id)) continue;
+        if (order.side === "buy" && getSystemControls(db).kill_switch_enabled) continue;
+
         const price =
           order.chain === "solana"
             ? await getSolanaPrice(solConnection, solWallet!, order.pool_ref)
@@ -120,22 +144,45 @@ export function startLimitOrderEngine(deps: EngineDeps) {
           `[limit-order] triggered: ${order.chain} ${order.side} ${order.identifier} @ ${price} (trigger ${order.trigger_price}) for user ${order.user_id}`
         );
 
+        const decision = evaluateTradePolicy(db, config, {
+          userId: order.user_id,
+          chain: order.chain,
+          side: order.side,
+          amount,
+          source: "limit_order",
+        });
+        if (!decision.allowed) {
+          auditedBlockedOrders.add(order.id);
+          continue;
+        }
+        lifecycle = beginTrackedTrade(db, {
+          userId: order.user_id,
+          chain: order.chain,
+          side: order.side,
+          source: "limit_order",
+          asset: order.identifier,
+          amount,
+        });
+
         if (order.chain === "solana") {
           if (order.side === "buy") {
             await executeSolanaBuy({
               connection: solConnection,
               wallet: solWallet!,
               poolId: order.pool_ref,
-              amountInLamports: BigInt(Math.floor(order.amount * 1e9)),
-              slippageBps: 500,
+              amountInLamports: parseUnitsExact(amount, 9),
+              slippageBps: decision.maxSlippageBps,
+              assertCanSubmit: () => assertBuyEntryEnabled(db, order.user_id, "solana", "limit_order"),
+              onLifecycleEvent: lifecycle.observe,
             });
           } else {
             await executeSolanaSell({
               connection: solConnection,
               wallet: solWallet!,
               poolId: order.pool_ref,
-              amountInTokenBaseUnits: toBaseUnits(order.amount, order.decimals),
-              slippageBps: 500,
+              amountInTokenBaseUnits: toBaseUnits(amount, order.decimals),
+              slippageBps: decision.maxSlippageBps,
+              onLifecycleEvent: lifecycle.observe,
             });
           }
         } else {
@@ -144,8 +191,10 @@ export function startLimitOrderEngine(deps: EngineDeps) {
               provider: evmProvider,
               wallet: evmWallet!,
               tokenAddress: order.identifier,
-              amountInEth: String(order.amount),
-              slippageBps: 500,
+              amountInEth: amount,
+              slippageBps: decision.maxSlippageBps,
+              assertCanSubmit: () => assertBuyEntryEnabled(db, order.user_id, "evm", "limit_order"),
+              onLifecycleEvent: lifecycle.observe,
             });
             recordHolding(db, "evm", order.user_id, order.identifier);
           } else {
@@ -153,14 +202,17 @@ export function startLimitOrderEngine(deps: EngineDeps) {
               provider: evmProvider,
               wallet: evmWallet!,
               tokenAddress: order.identifier,
-              amountInTokenBaseUnits: toBaseUnits(order.amount, order.decimals),
-              slippageBps: 500,
+              amountInTokenBaseUnits: toBaseUnits(amount, order.decimals),
+              slippageBps: decision.maxSlippageBps,
+              onLifecycleEvent: lifecycle.observe,
             });
           }
         }
 
         markFilled(db, order.id);
       } catch (err) {
+        lifecycle?.failIfNotSubmitted(err);
+        if (lifecycle?.wasSubmitted) markFilled(db, order.id);
         console.error(`[limit-order] error processing order ${order.id}:`, err);
       }
     }

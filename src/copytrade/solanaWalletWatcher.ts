@@ -5,7 +5,7 @@ export interface CopyTradeEvent {
   side: "buy" | "sell";
   mint: string;
   uiAmountChange: number; // absolute value, sign is carried by `side`
-  solChange: number; // native SOL delta for the watched wallet, negative = spent
+  solChangeLamports: string; // signed native SOL delta for the watched wallet
 }
 
 type CopyTradeHandler = (event: CopyTradeEvent) => void;
@@ -55,8 +55,8 @@ function diffTokenBalances(
 
   const accountKeys = tx.transaction.message.accountKeys.map((k) => k.pubkey.toBase58());
   const walletIndex = accountKeys.indexOf(targetWallet);
-  const solChange =
-    walletIndex >= 0 ? (postBalances[walletIndex] - preBalances[walletIndex]) / 1e9 : 0;
+  const solChangeLamports =
+    walletIndex >= 0 ? (BigInt(postBalances[walletIndex]) - BigInt(preBalances[walletIndex])).toString() : "0";
 
   const events: CopyTradeEvent[] = [];
   const preByMint = new Map(
@@ -78,7 +78,7 @@ function diffTokenBalances(
       side: delta > 0 ? "buy" : "sell",
       mint,
       uiAmountChange: Math.abs(delta),
-      solChange,
+      solChangeLamports,
     });
   }
 

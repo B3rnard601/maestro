@@ -1,32 +1,49 @@
 import { Telegraf, Markup } from "telegraf";
+import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
-import { Connection, PublicKey } from "@solana/web3.js";
-import { Provider } from "ethers";
+import { isPositiveDecimal, parseUnitsExact } from "../shared/amount.js";
+import type { AppConfig } from "../config/env.js";
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { Contract, formatUnits, getAddress, isAddress, JsonRpcProvider, Provider } from "ethers";
 import { WalletVault } from "../vault/wallet-vault.js";
 import {
-  createMnemonicWallet,
   importMnemonicWallet,
   importRawSolanaWallet,
   importRawEvmWallet,
   revealSecret,
   eraseWallet,
+  loadEvmWalletByLabel,
+  loadSolanaKeypair,
 } from "../vault/walletHelpers.js";
 import { CopyTradeRegistry } from "../copytrade/registry.js";
 import { createOrder, cancelOrder } from "../orders/limitOrderEngine.js";
 import { getSolanaPortfolio, getEvmPortfolio } from "../portfolio/portfolio.js";
 import {
   getHoldings,
+  getSystemControls,
   getOrCreateUser,
   getUser,
+  listRecentSecurityEvents,
   listUsers,
   listPendingUsers,
   setUserStatus,
+  setKillSwitch,
   updateUserSettings,
   listWalletsFor,
   getWallet,
   setPrimaryWallet,
   recordWalletImport,
+  getPrimaryWallet,
+  recordHolding,
+  recordSecurityEvent,
+  listRecentTradesForUser,
 } from "../db/db.js";
+import { executeBuy as executeSolanaBuy, executeSell as executeSolanaSell, quoteBuy as quoteSolanaBuy, quoteSell as quoteSolanaSell } from "../chains/solana/executor.js";
+import { executeBuy as executeEvmBuy, executeSell as executeEvmSell, quoteBuy as quoteEvmBuy, quoteSell as quoteEvmSell } from "../chains/evm/executor.js";
+import { assertBuyEntryEnabled, evaluateTradePolicy } from "../risk/policy.js";
+import { formatUnitsExact } from "../shared/amount.js";
+import type { Wallet as EvmWallet } from "ethers";
+import { beginTrackedTrade } from "../transactions/tracker.js";
 
 export interface BotDeps {
   vault: WalletVault;
@@ -34,6 +51,9 @@ export interface BotDeps {
   copyRegistry: CopyTradeRegistry;
   solConnection: Connection;
   evmProvider: Provider;
+  evmHttpProvider: JsonRpcProvider;
+  adminBootstrapId: string;
+  tradingLimits: Pick<AppConfig, "maxTradeSol" | "maxTradeEth" | "maxSlippageBps" | "tradeQuoteTtlSeconds">;
 }
 
 const HELP_TEXT = `maestro
@@ -45,8 +65,10 @@ const HOME_TEXT = `MAESTRO\nYour self-custody trading desk.\n\nChoose a section 
 function homeKeyboard(isAdmin: boolean) {
   const rows = [
     [Markup.button.callback("💼 Wallets", "home_wallets"), Markup.button.callback("📊 Portfolio", "wallets_portfolio")],
+    [Markup.button.callback("🔄 Trade", "home_trade")],
     [Markup.button.callback("🎯 Auto-buy", "home_snipe"), Markup.button.callback("🔁 Copy trading", "home_copytrade")],
-    [Markup.button.callback("📈 Orders", "home_orders"), Markup.button.callback("❔ Help", "home_help")],
+    [Markup.button.callback("📈 Orders", "home_orders"), Markup.button.callback("🧾 Recent trades", "home_trades")],
+    [Markup.button.callback("❔ Help", "home_help")],
   ];
   if (isAdmin) rows.push([Markup.button.callback("🛡 Admin", "home_admin")]);
   return Markup.inlineKeyboard(rows);
@@ -56,7 +78,7 @@ const ADMIN_HELP_TEXT = `
 Admin tools are available from the Admin button on the main menu.`;
 
 const walletsMenu = Markup.inlineKeyboard([
-  [Markup.button.callback("➕ New Wallet", "wallets_new"), Markup.button.callback("📥 Import wallet", "wallets_import")],
+  [Markup.button.callback("📥 Import wallet", "wallets_import")],
   [Markup.button.callback("📋 My Wallets", "wallets_list"), Markup.button.callback("📊 Portfolio", "wallets_portfolio")],
   [Markup.button.callback("↩️ Home", "home")],
 ]);
@@ -65,9 +87,9 @@ const REVEAL_AUTO_DELETE_MS = 60_000;
 const cancelPromptKeyboard = Markup.inlineKeyboard([[Markup.button.callback("Cancel", "flow_cancel")]]);
 
 export function createBot(token: string, deps: BotDeps): Telegraf {
-  const { vault, db, copyRegistry, solConnection, evmProvider } = deps;
+  const { vault, db, copyRegistry, solConnection, evmProvider, evmHttpProvider, tradingLimits } = deps;
   const bot = new Telegraf(token);
-  const adminBootstrapId = process.env.TELEGRAM_OWNER_ID;
+  const adminBootstrapId = deps.adminBootstrapId;
 
   if (!adminBootstrapId) {
     console.warn(
@@ -141,15 +163,21 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     identifier?: string;
     poolRef?: string;
     triggerPrice?: number;
-    amount?: number;
+    amount?: string;
     decimals?: number;
+  };
+  type ManualTradeDraft = {
+    asset?: string;
+    poolId?: string;
+    amount?: string;
   };
   type PendingInput =
     | { kind: "snipe_size"; chain: "solana" | "evm" }
+    | { kind: "manual_trade"; chain: "solana" | "evm"; side: "buy" | "sell"; step: "asset" | "pool" | "amount"; values: ManualTradeDraft }
     | { kind: "copy_target" }
     | { kind: "copy_ratio" }
-    | { kind: "copy_max"; ratio: number }
-    | { kind: "copy_sells"; ratio: number; maxAmount: number }
+    | { kind: "copy_max"; ratio: string }
+    | { kind: "copy_sells"; ratio: string; maxAmount: string }
     | {
         kind: "order_value";
         chain: "solana" | "evm";
@@ -159,8 +187,155 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       }
     | { kind: "admin_user_status"; status: "active" | "banned"; action: "approve" | "ban" | "unban" };
 
+  type ManualTradeQuote = {
+    userId: string;
+    chain: "solana" | "evm";
+    side: "buy" | "sell";
+    asset: string;
+    poolId?: string;
+    amount: string;
+    amountBaseUnits: bigint;
+    inputDecimals: number;
+    outputMint?: string;
+    expectedAmountOut: bigint;
+    minimumAmountOut: bigint;
+    outputDecimals: number;
+    slippageBps: number;
+    requiresApproval: boolean;
+    expiresAt: number;
+  };
+
   const pendingImport = new Map<number, PendingImport>();
   const pendingInputs = new Map<number, PendingInput>();
+  const killSwitchConfirmations = new Map<string, { userId: string; enabled: boolean; expiresAt: number }>();
+  const manualTradeQuotes = new Map<string, ManualTradeQuote>();
+
+  function getSolanaTradeWallet(userId: string): Keypair {
+    const primary = getPrimaryWallet(db, userId, "solana");
+    if (!primary) throw new Error("Create a Solana wallet before trading.");
+    const wallet = loadSolanaKeypair(vault, db, userId, primary.label);
+    if (!wallet) throw new Error("Couldn't unlock your primary Solana wallet.");
+    return wallet;
+  }
+
+  function getEvmTradeWallet(userId: string): EvmWallet {
+    const primary = getPrimaryWallet(db, userId, "evm");
+    if (!primary) throw new Error("Create an EVM wallet before trading.");
+    const wallet = loadEvmWalletByLabel(vault, db, userId, primary.label);
+    if (!wallet) throw new Error("Couldn't unlock your primary EVM wallet.");
+    return wallet;
+  }
+
+  async function createManualTradeQuote(
+    userId: string,
+    chain: "solana" | "evm",
+    side: "buy" | "sell",
+    values: ManualTradeDraft
+  ): Promise<{ id: string; quote: ManualTradeQuote }> {
+    if (!values.amount) throw new Error("Trade amount is missing.");
+    const amount = values.amount;
+    const policy = evaluateTradePolicy(db, tradingLimits, {
+      userId,
+      chain,
+      side,
+      amount,
+      source: "manual",
+    });
+    if (!policy.allowed) throw new Error(`Trade not allowed: ${policy.reasons.join(", ")}.`);
+
+    let quote: ManualTradeQuote;
+    if (chain === "solana") {
+      const wallet = getSolanaTradeWallet(userId);
+      const poolId = values.poolId;
+      if (!poolId) throw new Error("Solana pool ID is missing.");
+      let amountBaseUnits: bigint;
+      let inputDecimals = 9;
+      let asset = "";
+      if (side === "buy") {
+        if (!isPositiveDecimal(amount, 9)) throw new Error("Enter a valid SOL amount with up to 9 decimal places.");
+        amountBaseUnits = parseUnitsExact(amount, 9);
+        const result = await quoteSolanaBuy({ connection: solConnection, wallet, poolId, amountInLamports: amountBaseUnits, slippageBps: policy.maxSlippageBps });
+        asset = result.outputMint;
+        quote = {
+          userId, chain, side, asset, poolId, amount, amountBaseUnits, inputDecimals,
+          outputMint: result.outputMint, expectedAmountOut: result.expectedAmountOut,
+          minimumAmountOut: result.minimumAmountOut, outputDecimals: result.outputDecimals,
+          slippageBps: policy.maxSlippageBps, requiresApproval: false,
+          expiresAt: Date.now() + tradingLimits.tradeQuoteTtlSeconds * 1000,
+        };
+      } else {
+        if (!values.asset) throw new Error("Solana token mint is missing.");
+        const mint = new PublicKey(values.asset);
+        asset = mint.toBase58();
+        const [mintInfo, tokenAccounts] = await Promise.all([
+          solConnection.getTokenSupply(mint),
+          solConnection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint }),
+        ]);
+        inputDecimals = mintInfo.value.decimals;
+        if (!isPositiveDecimal(amount, inputDecimals)) throw new Error(`Enter a positive token amount with up to ${inputDecimals} decimal places.`);
+        amountBaseUnits = parseUnitsExact(amount, inputDecimals);
+        const balance = tokenAccounts.value.reduce((sum, account) => sum + BigInt(account.account.data.parsed.info.tokenAmount.amount), 0n);
+        if (amountBaseUnits > balance) throw new Error(`Insufficient token balance. Available: ${formatUnitsExact(balance, inputDecimals)}.`);
+        const result = await quoteSolanaSell({
+          connection: solConnection, wallet, poolId, tokenMint: asset,
+          amountInTokenBaseUnits: amountBaseUnits, slippageBps: policy.maxSlippageBps,
+        });
+        quote = {
+          userId, chain, side, asset, poolId, amount, amountBaseUnits, inputDecimals,
+          outputMint: result.outputMint, expectedAmountOut: result.expectedAmountOut,
+          minimumAmountOut: result.minimumAmountOut, outputDecimals: result.outputDecimals,
+          slippageBps: policy.maxSlippageBps, requiresApproval: false,
+          expiresAt: Date.now() + tradingLimits.tradeQuoteTtlSeconds * 1000,
+        };
+      }
+    } else {
+      if (!values.asset || !isAddress(values.asset)) throw new Error("Enter a valid EVM token address.");
+      const asset = getAddress(values.asset);
+      const wallet = getEvmTradeWallet(userId);
+      if (side === "buy") {
+        if (!isPositiveDecimal(amount, 18)) throw new Error("Enter a valid ETH amount with up to 18 decimal places.");
+        const amountBaseUnits = parseUnitsExact(amount, 18);
+        const result = await quoteEvmBuy({
+          provider: evmHttpProvider, tokenAddress: asset, amountInEth: amount, slippageBps: policy.maxSlippageBps,
+        });
+        quote = {
+          userId, chain, side, asset, amount, amountBaseUnits, inputDecimals: 18,
+          expectedAmountOut: result.expectedAmountOut, minimumAmountOut: result.minimumAmountOut,
+          outputDecimals: result.outputDecimals, slippageBps: policy.maxSlippageBps,
+          requiresApproval: false, expiresAt: Date.now() + tradingLimits.tradeQuoteTtlSeconds * 1000,
+        };
+      } else {
+        const token = new Contract(asset, ["function decimals() view returns (uint8)", "function balanceOf(address) view returns (uint256)"], evmHttpProvider);
+        const [decimals, balance] = await Promise.all([
+          token.decimals() as Promise<bigint>,
+          token.balanceOf(wallet.address) as Promise<bigint>,
+        ]);
+        const inputDecimals = Number(decimals);
+        if (!Number.isInteger(inputDecimals) || inputDecimals < 0 || inputDecimals > 255 || !isPositiveDecimal(amount, inputDecimals)) {
+          throw new Error("Enter a positive token amount with a valid token precision.");
+        }
+        const amountBaseUnits = parseUnitsExact(amount, inputDecimals);
+        if (amountBaseUnits > balance) throw new Error(`Insufficient token balance. Available: ${formatUnits(balance, inputDecimals)}.`);
+        const result = await quoteEvmSell({
+          provider: evmHttpProvider, wallet, tokenAddress: asset, amountInTokenBaseUnits: amountBaseUnits,
+          slippageBps: policy.maxSlippageBps,
+        });
+        quote = {
+          userId, chain, side, asset, amount, amountBaseUnits, inputDecimals,
+          expectedAmountOut: result.expectedAmountOut, minimumAmountOut: result.minimumAmountOut,
+          outputDecimals: result.outputDecimals, slippageBps: policy.maxSlippageBps,
+          requiresApproval: result.requiresApproval, expiresAt: Date.now() + tradingLimits.tradeQuoteTtlSeconds * 1000,
+        };
+      }
+    }
+
+    for (const [id, existing] of manualTradeQuotes) {
+      if (existing.expiresAt <= Date.now() || existing.userId === userId) manualTradeQuotes.delete(id);
+    }
+    const id = randomUUID();
+    manualTradeQuotes.set(id, quote);
+    return { id, quote };
+  }
 
   function askOrderValue(ctx: any, pending: Extract<PendingInput, { kind: "order_value" }>) {
     pendingInputs.set(ctx.from!.id, pending);
@@ -201,6 +376,181 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.reply("Wallets", walletsMenu);
   });
 
+  bot.action("home_trade", async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      "Choose a manual trade. Every trade requires a fresh quote and your explicit confirmation.",
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Buy", "trade_start_buy"), Markup.button.callback("Sell", "trade_start_sell")],
+        [Markup.button.callback("↩️ Home", "home")],
+      ])
+    );
+  });
+
+  bot.action("home_trades", async (ctx) => {
+    await ctx.answerCbQuery();
+    const trades = listRecentTradesForUser(db, String(ctx.from!.id), 10);
+    const text = trades.length === 0
+      ? "No tracked trades yet."
+      : trades.map((trade) => {
+          const date = new Date(trade.created_at).toISOString().replace("T", " ").slice(0, 19);
+          const ref = trade.transaction_ref ?? trade.approval_transaction_ref;
+          const error = trade.error ? `\n  Note: ${trade.error}` : "";
+          return `${date} · ${trade.chain.toUpperCase()} ${trade.side.toUpperCase()} ${trade.amount} · ${trade.source} · ${trade.status.toUpperCase()}` +
+            `${ref ? `\n  Tx: ${ref}` : ""}${trade.bundle_ref ? `\n  Bundle: ${trade.bundle_ref}` : ""}${error}`;
+        }).join("\n\n");
+    await ctx.reply(
+      `RECENT TRADES\n\n${text}\n\nUnknown means the RPC did not provide a final status in time; reconciliation continues.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("🔄 Refresh", "home_trades"), Markup.button.callback("🔄 Trade", "home_trade")],
+        [Markup.button.callback("↩️ Home", "home")],
+      ])
+    );
+  });
+
+  bot.action(/^trade_start_(buy|sell)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const side = ctx.match[1] as "buy" | "sell";
+    await ctx.reply(
+      `Choose the chain for your manual ${side}.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Solana", `trade_chain_${side}_solana`), Markup.button.callback("EVM", `trade_chain_${side}_evm`)],
+        [Markup.button.callback("Cancel", "flow_cancel")],
+      ])
+    );
+  });
+
+  bot.action(/^trade_chain_(buy|sell)_(solana|evm)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const side = ctx.match[1] as "buy" | "sell";
+    const chain = ctx.match[2] as "solana" | "evm";
+    const step: Extract<PendingInput, { kind: "manual_trade" }>["step"] =
+      chain === "evm" || side === "sell" ? "asset" : "pool";
+    const pending = { kind: "manual_trade" as const, side, chain, step, values: {} };
+    pendingInputs.set(ctx.from!.id, pending);
+    const prompt = step === "asset"
+      ? chain === "solana"
+        ? "Send the Solana token mint to sell."
+        : "Send the EVM token contract address."
+      : "Send the Raydium SOL/token pool ID.";
+    await ctx.reply(prompt, cancelPromptKeyboard);
+  });
+
+  bot.action(/^trade_confirm_([0-9a-f-]+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    const quote = manualTradeQuotes.get(id);
+    if (!quote || quote.userId !== String(ctx.from!.id)) {
+      return ctx.answerCbQuery("This quote is unavailable or belongs to another user.");
+    }
+    manualTradeQuotes.delete(id);
+    await ctx.answerCbQuery();
+    if (quote.expiresAt <= Date.now()) {
+      return ctx.reply("This quote expired. Request a new quote before trading.");
+    }
+
+    const decision = evaluateTradePolicy(db, tradingLimits, {
+      userId: quote.userId,
+      chain: quote.chain,
+      side: quote.side,
+      amount: quote.amount,
+      source: "manual",
+    });
+    if (!decision.allowed) {
+      return ctx.reply(`Trade not allowed: ${decision.reasons.join(", ")}. Request a new quote after resolving this.`);
+    }
+
+    let lifecycle: ReturnType<typeof beginTrackedTrade> | undefined;
+    try {
+      lifecycle = beginTrackedTrade(db, {
+        userId: quote.userId,
+        chain: quote.chain,
+        side: quote.side,
+        source: "manual",
+        asset: quote.asset,
+        amount: quote.amount,
+      });
+      let submissionId: string;
+      if (quote.chain === "solana") {
+        const wallet = getSolanaTradeWallet(quote.userId);
+        const poolId = quote.poolId!;
+        submissionId = quote.side === "buy"
+          ? await executeSolanaBuy({
+              connection: solConnection,
+              wallet,
+              poolId,
+              amountInLamports: quote.amountBaseUnits,
+              slippageBps: quote.slippageBps,
+              approvedMinimumOut: quote.minimumAmountOut,
+              assertCanSubmit: () => assertBuyEntryEnabled(db, quote.userId, "solana", "manual"),
+              onLifecycleEvent: lifecycle.observe,
+            })
+          : await executeSolanaSell({
+              connection: solConnection,
+              wallet,
+              poolId,
+              amountInTokenBaseUnits: quote.amountBaseUnits,
+              slippageBps: quote.slippageBps,
+              approvedMinimumOut: quote.minimumAmountOut,
+              onLifecycleEvent: lifecycle.observe,
+            });
+      } else {
+        const wallet = getEvmTradeWallet(quote.userId);
+        submissionId = quote.side === "buy"
+          ? await executeEvmBuy({
+              provider: evmHttpProvider,
+              wallet,
+              tokenAddress: quote.asset,
+              amountInEth: quote.amount,
+              slippageBps: quote.slippageBps,
+              approvedMinimumOut: quote.minimumAmountOut,
+              assertCanSubmit: () => assertBuyEntryEnabled(db, quote.userId, "evm", "manual"),
+              onLifecycleEvent: lifecycle.observe,
+            })
+          : await executeEvmSell({
+              provider: evmHttpProvider,
+              wallet,
+              tokenAddress: quote.asset,
+              amountInTokenBaseUnits: quote.amountBaseUnits,
+              slippageBps: quote.slippageBps,
+              approvedMinimumOut: quote.minimumAmountOut,
+              confirmedRequiresApproval: quote.requiresApproval,
+              onLifecycleEvent: lifecycle.observe,
+            });
+        if (quote.side === "buy") recordHolding(db, "evm", quote.userId, quote.asset);
+      }
+      recordSecurityEvent(db, {
+        eventType: "MANUAL_TRADE_SUBMITTED",
+        actorUserId: quote.userId,
+        subjectUserId: quote.userId,
+        chain: quote.chain,
+        side: quote.side,
+        amount: quote.amount,
+        source: "manual",
+        details: { asset: quote.asset, poolId: quote.poolId ?? null, submissionId },
+      });
+      await ctx.reply(`Trade submitted.\nTracking ID: ${lifecycle.id}\nTransaction: ${submissionId}`);
+    } catch (err) {
+      lifecycle?.failIfNotSubmitted(err);
+      console.error(`[trade] confirmed ${quote.chain} ${quote.side} failed for user ${quote.userId}:`, err);
+      if (lifecycle?.wasSubmitted) {
+        await ctx.reply(
+          `Submission status is not yet known (${err instanceof Error ? err.message : "network error"}). Check Recent trades before retrying to avoid a duplicate trade.`,
+          Markup.inlineKeyboard([[Markup.button.callback("🧾 Recent trades", "home_trades")]])
+        );
+      } else {
+        await ctx.reply(`Trade was not submitted: ${err instanceof Error ? err.message : "unknown error"}. Request a fresh quote to try again.`);
+      }
+    }
+  });
+
+  bot.action(/^trade_cancel_([0-9a-f-]+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    const quote = manualTradeQuotes.get(id);
+    if (quote?.userId === String(ctx.from!.id)) manualTradeQuotes.delete(id);
+    await ctx.answerCbQuery("Quote cancelled.");
+    await ctx.reply("Quote cancelled.", homeKeyboard((ctx as any).dbUser?.role === "admin"));
+  });
+
   bot.action("home_help", async (ctx) => {
     await ctx.answerCbQuery();
     const user = (ctx as any).dbUser;
@@ -210,7 +560,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   async function showSnipeSettings(ctx: any) {
     const user = getUser(db, String(ctx.from!.id))!;
     await ctx.reply(
-      `AUTO-BUY · ${user.snipe_enabled ? "ON" : "OFF"}\n\nWhen enabled, new-pair detection can place real mainnet trades from your primary wallet.\n\nTrade sizes: ${user.snipe_size_sol} SOL / ${user.snipe_size_eth} ETH.`,
+      `AUTO-BUY · ${user.snipe_enabled ? "ON" : "OFF"}\n\nWhen enabled, new-pair detection can place real mainnet trades from your primary wallet.\n\nTrade sizes: ${user.snipe_size_sol_exact} SOL / ${user.snipe_size_eth_exact} ETH.\nMaximum per buy: ${tradingLimits.maxTradeSol} SOL / ${tradingLimits.maxTradeEth} ETH.`,
       Markup.inlineKeyboard([
         [Markup.button.callback("✅ Enable", "home_snipe_enable"), Markup.button.callback("⏸ Disable", "home_snipe_disable")],
         [Markup.button.callback("Set SOL size", "home_snipe_size_solana"), Markup.button.callback("Set ETH size", "home_snipe_size_evm")],
@@ -248,7 +598,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const user = getUser(db, String(ctx.from!.id))!;
     const target = user.copy_target;
     await ctx.reply(
-      `COPY TRADING · ${target ? "ON" : "OFF"}${target ? `\n\nFollowing: ${target}` : "\n\nNo wallet is being followed."}\n\nSizing: ${user.copy_size_ratio} ratio, max ${user.copy_max_amount}, copy sells ${user.copy_sells ? "on" : "off"}.`,
+      `COPY TRADING · ${target ? "ON" : "OFF"}${target ? `\n\nFollowing: ${target}` : "\n\nNo wallet is being followed."}\n\nSizing: ${user.copy_size_ratio_exact} ratio, max ${user.copy_max_amount_exact}, copy sells ${user.copy_sells ? "on" : "off"}.`,
       Markup.inlineKeyboard([
         [Markup.button.callback(target ? "Change target wallet" : "Set target wallet", "home_copytrade_set")],
         [Markup.button.callback("Configure sizing", "home_copytrade_config")],
@@ -276,8 +626,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     pendingInputs.delete(ctx.from!.id);
     updateUserSettings(db, String(ctx.from!.id), {
-      copy_size_ratio: pending.ratio,
-      copy_max_amount: pending.maxAmount,
+      copy_size_ratio: Number(pending.ratio),
+      copy_size_ratio_exact: pending.ratio,
+      copy_max_amount: Number(pending.maxAmount),
+      copy_max_amount_exact: pending.maxAmount,
       copy_sells: Number(ctx.match[1]),
     });
     await ctx.reply("Copy-trade settings updated.", Markup.inlineKeyboard([[Markup.button.callback("Copy trading", "home_copytrade")], [Markup.button.callback("Home", "home")]]));
@@ -287,6 +639,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     pendingImport.delete(ctx.from!.id);
     pendingInputs.delete(ctx.from!.id);
+    for (const [id, quote] of manualTradeQuotes) {
+      if (quote.userId === String(ctx.from!.id)) manualTradeQuotes.delete(id);
+    }
     await ctx.reply("Cancelled.", homeKeyboard((ctx as any).dbUser?.role === "admin"));
   });
 
@@ -301,7 +656,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   async function showOrders(ctx: any) {
     const rows = db
-      .prepare(`SELECT id, chain, identifier, side, direction, trigger_price, amount, status FROM limit_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`)
+      .prepare(`SELECT id, chain, identifier, side, direction, trigger_price, COALESCE(amount_exact, CAST(amount AS TEXT)) AS amount, status FROM limit_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`)
       .all(String(ctx.from!.id)) as any[];
     const lines = rows.length === 0
       ? ["No orders yet."]
@@ -401,16 +756,89 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   bot.action("home_admin", async (ctx) => {
     await ctx.answerCbQuery();
     if (!requireAdmin(ctx)) return;
+    const killSwitchEnabled = getSystemControls(db).kill_switch_enabled === 1;
     await ctx.reply(
-      "ADMIN",
+      `ADMIN\n\nBuy entries: ${killSwitchEnabled ? "PAUSED (kill switch enabled)" : "allowed"}\nOpen buy limit orders stay queued while paused. Sell/exit orders remain permitted.`,
       Markup.inlineKeyboard([
         [Markup.button.callback("🕓 Pending approvals", "home_admin_pending"), Markup.button.callback("📊 Stats", "home_admin_stats")],
         [Markup.button.callback("👥 All users", "home_admin_users")],
         [Markup.button.callback("✅ Approve by ID", "home_admin_approve_id"), Markup.button.callback("🚫 Ban by ID", "home_admin_ban_id")],
         [Markup.button.callback("♻️ Unban by ID", "home_admin_unban_id")],
+        [Markup.button.callback(killSwitchEnabled ? "▶️ Resume buy entries" : "⛔ Pause buy entries", "home_admin_kill_switch")],
+        [Markup.button.callback("🧾 Recent risk audit", "home_admin_audit")],
         [Markup.button.callback("↩️ Home", "home")],
       ])
     );
+  });
+
+  bot.action("home_admin_kill_switch", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    const enabling = getSystemControls(db).kill_switch_enabled === 0;
+    const now = Date.now();
+    for (const [id, confirmation] of killSwitchConfirmations) {
+      if (confirmation.expiresAt <= now) killSwitchConfirmations.delete(id);
+    }
+    const confirmationId = randomUUID();
+    killSwitchConfirmations.set(confirmationId, {
+      userId: String(ctx.from!.id),
+      enabled: enabling,
+      expiresAt: now + 60_000,
+    });
+    await ctx.reply(
+      enabling
+        ? "Pause all new buy entries? Open buy limit orders will stay queued and may execute after resume. Existing sell/exit orders will continue to run."
+        : "Resume new buy entries? Configured size and slippage limits will still apply.",
+      Markup.inlineKeyboard([
+        [Markup.button.callback(enabling ? "Confirm pause" : "Confirm resume", `kill_switch_confirm_${confirmationId}`)],
+        [Markup.button.callback("Cancel", "home_admin")],
+      ])
+    );
+  });
+
+  bot.action(/^kill_switch_confirm_(.+)$/, async (ctx) => {
+    if (!requireAdmin(ctx)) return ctx.answerCbQuery("Admin only.");
+    const confirmationId = ctx.match[1];
+    const confirmation = killSwitchConfirmations.get(confirmationId);
+    if (!confirmation || confirmation.expiresAt <= Date.now()) {
+      killSwitchConfirmations.delete(confirmationId);
+      return ctx.answerCbQuery("This confirmation expired. Open Admin to request a new one.");
+    }
+    if (confirmation.userId !== String(ctx.from!.id)) {
+      return ctx.answerCbQuery("Only the admin who requested this confirmation can use it.");
+    }
+    killSwitchConfirmations.delete(confirmationId);
+    await ctx.answerCbQuery();
+    const enabled = confirmation.enabled;
+    setKillSwitch(db, enabled, String(ctx.from!.id));
+    await ctx.reply(
+      enabled
+        ? "Buy entries paused. Open buy limit orders remain queued; sell/exit orders remain allowed."
+        : "Buy entries resumed. Queued orders may execute, subject to risk limits.",
+      Markup.inlineKeyboard([[Markup.button.callback("Admin menu", "home_admin")], [Markup.button.callback("Home", "home")]])
+    );
+  });
+
+  bot.action("home_admin_audit", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    const events = listRecentSecurityEvents(db, 10);
+    if (events.length === 0) return ctx.reply("No risk events recorded yet.", Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
+    const lines = events.map((event) => {
+      const time = new Date(event.created_at).toISOString();
+      const identity = event.subject_user_id ? ` user=${event.subject_user_id}` : "";
+      const trade = event.chain ? ` ${event.chain} ${event.side ?? ""}${event.amount ? ` ${event.amount}` : ""}` : "";
+      let detail = "";
+      try {
+        const parsed = JSON.parse(event.details_json) as { reasons?: unknown };
+        if (Array.isArray(parsed.reasons) && parsed.reasons.length > 0) detail = ` (${parsed.reasons.join(", ")})`;
+      } catch (err) {
+        console.error(`[audit] couldn't parse details for event ${event.event_type}:`, err);
+        detail = " (details unavailable)";
+      }
+      return `${time} ${event.event_type}${identity}${trade}${detail}`;
+    });
+    await ctx.reply(lines.join("\n"), Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
   });
 
   bot.action("home_admin_pending", async (ctx) => {
@@ -466,13 +894,6 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   // --- Wallets menu ---
   bot.command("wallets", (ctx) => ctx.reply("Wallets:", walletsMenu));
 
-  bot.action("wallets_new", async (ctx) => {
-    ctx.answerCbQuery();
-    const userId = String(ctx.from!.id);
-    const result = createMnemonicWallet(vault, db, userId);
-    await sendNewWalletReveal(ctx, result);
-  });
-
   bot.action("wallets_import", (ctx) => {
     ctx.answerCbQuery();
     pendingImport.set(ctx.from!.id, { kind: "wallet" });
@@ -488,17 +909,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     ctx.reply("Import cancelled.");
   });
 
-  async function sendNewWalletReveal(ctx: any, result: { label: string; mnemonic: string; solanaAddress: string; evmAddress: string }) {
-    await ctx.reply(
-      `Wallet "${result.label}" created:\nSolana: ${result.solanaAddress}\nEVM: ${result.evmAddress}\n\n` +
-        (listWalletsFor(db, String(ctx.from!.id)).filter((w) => w.chain === "solana").length === 1
-          ? "Set as your primary wallet automatically (first one).\n\n"
-          : "")
-    );
-    await sendSecretReveal(ctx, "Seed phrase (backs both addresses above)", result.mnemonic);
-  }
-
-  /** Sends a secret as its own message, warns, and schedules auto-delete. Used for both new-wallet display and later reveals. */
+  /** Sends a stored wallet secret as its own message, warns, and schedules auto-delete. */
   async function sendSecretReveal(ctx: any, label: string, value: string) {
     const sent = await ctx.reply(`⚠️ ${label} — do not share this:\n\n${value}\n\nThis message auto-deletes in 60s. Save it somewhere secure now.`);
     setTimeout(() => {
@@ -594,17 +1005,124 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       };
 
       if (pendingInput.kind === "snipe_size") {
+        const decimals = pendingInput.chain === "solana" ? 9 : 18;
+        const cap = pendingInput.chain === "solana" ? tradingLimits.maxTradeSol : tradingLimits.maxTradeEth;
+        if (!isPositiveDecimal(input, decimals)) {
+          return keepPrompt(`Enter a positive amount with at most ${decimals} fractional digits.`);
+        }
+        if (parseUnitsExact(input, decimals) > parseUnitsExact(cap, decimals)) {
+          return keepPrompt(`The configured maximum is ${cap} ${pendingInput.chain === "solana" ? "SOL" : "ETH"}.`);
+        }
         const amount = Number(input);
-        if (!Number.isFinite(amount) || amount <= 0) return keepPrompt("Enter a positive number for the auto-buy size.");
+        if (!Number.isFinite(amount)) return keepPrompt("That amount is outside the supported range.");
         updateUserSettings(
           db,
           String(ctx.from!.id),
-          pendingInput.chain === "solana" ? { snipe_size_sol: amount } : { snipe_size_eth: amount }
+          pendingInput.chain === "solana"
+            ? { snipe_size_sol: amount, snipe_size_sol_exact: input }
+            : { snipe_size_eth: amount, snipe_size_eth_exact: input }
         );
         await ctx.reply(
-          `Auto-buy size set to ${amount} ${pendingInput.chain === "solana" ? "SOL" : "ETH"}.`,
+          `Auto-buy size set to ${input} ${pendingInput.chain === "solana" ? "SOL" : "ETH"}.`,
           Markup.inlineKeyboard([[Markup.button.callback("Auto-buy settings", "home_snipe")], [Markup.button.callback("Home", "home")]])
         );
+        return;
+      }
+
+      if (pendingInput.kind === "manual_trade") {
+        const values = { ...pendingInput.values };
+        if (pendingInput.step === "asset") {
+          if (!input) return keepPrompt("Send a non-empty token address or mint.");
+          if (pendingInput.chain === "evm" && !isAddress(input)) return keepPrompt("Enter a valid EVM token contract address.");
+          if (pendingInput.chain === "solana") {
+            try {
+              values.asset = new PublicKey(input).toBase58();
+            } catch {
+              return keepPrompt("Enter a valid Solana token mint.");
+            }
+          } else {
+            values.asset = getAddress(input);
+          }
+          const nextStep: Extract<PendingInput, { kind: "manual_trade" }>["step"] =
+            pendingInput.chain === "solana" ? "pool" : "amount";
+          const next = { ...pendingInput, step: nextStep, values };
+          pendingInputs.set(ctx.from!.id, next);
+          await ctx.reply(
+            nextStep === "pool" ? "Send the Raydium SOL/token pool ID." : "Send the amount of tokens to sell.",
+            cancelPromptKeyboard
+          );
+          return;
+        }
+
+        if (pendingInput.step === "pool") {
+          if (!input) return keepPrompt("Send a non-empty Raydium pool ID.");
+          try {
+            values.poolId = new PublicKey(input).toBase58();
+          } catch {
+            return keepPrompt("Enter a valid Solana pool ID.");
+          }
+          pendingInputs.set(ctx.from!.id, { ...pendingInput, step: "amount", values });
+          await ctx.reply(
+            pendingInput.side === "buy" ? "Send the amount to spend in SOL." : "Send the token amount to sell.",
+            cancelPromptKeyboard
+          );
+          return;
+        }
+
+        values.amount = input;
+        if (pendingInput.side === "buy") {
+          const decimals = pendingInput.chain === "solana" ? 9 : 18;
+          if (!isPositiveDecimal(input, decimals)) {
+            return keepPrompt(`Enter a positive amount with at most ${decimals} fractional digits.`);
+          }
+        } else if (!/^\d+(?:\.\d+)?$/.test(input)) {
+          return keepPrompt("Enter a positive plain-decimal token amount.");
+        }
+
+        try {
+          const { id, quote } = await createManualTradeQuote(
+            String(ctx.from!.id),
+            pendingInput.chain,
+            pendingInput.side,
+            values
+          );
+          const inputLabel = quote.side === "buy"
+            ? `${quote.amount} ${quote.chain === "solana" ? "SOL" : "ETH"}`
+            : `${quote.amount} tokens`;
+          const asset = quote.chain === "solana" && quote.side === "buy" ? quote.outputMint! : quote.asset;
+          const outputLabel = quote.side === "sell"
+            ? `${quote.chain === "solana" ? "SOL" : "ETH"}`
+            : "tokens";
+          const expected = formatUnitsExact(quote.expectedAmountOut, quote.outputDecimals);
+          const minimum = formatUnitsExact(quote.minimumAmountOut, quote.outputDecimals);
+          const approvalNote = quote.requiresApproval
+            ? "\n\nAn exact-amount router approval transaction is also required before the sell."
+            : "";
+          const expirySeconds = Math.max(0, Math.floor((quote.expiresAt - Date.now()) / 1000));
+          await ctx.reply(
+            `TRADE PREVIEW · ${quote.chain.toUpperCase()} ${quote.side.toUpperCase()}\n\n` +
+              `${quote.side === "buy" ? "Spend" : "Sell"}: ${inputLabel}\n` +
+              `Token: ${asset}\n` +
+              `${quote.poolId ? `Pool: ${quote.poolId}\n` : ""}` +
+              `Expected output: ${expected} ${outputLabel}\n` +
+              `Minimum output: ${minimum} ${outputLabel}\n` +
+              `Maximum slippage: ${(quote.slippageBps / 100).toFixed(2)}%\n` +
+              `Quote expires in about ${expirySeconds} seconds.` +
+              `${quote.chain === "evm" && quote.side === "buy" ? "\nRouter estimate may not include token transfer taxes." : ""}` +
+              approvalNote +
+              "\n\nThe swap will abort if its refreshed minimum output is below the minimum shown here.",
+            Markup.inlineKeyboard([
+              [Markup.button.callback("✅ Confirm trade", `trade_confirm_${id}`)],
+              [Markup.button.callback("Cancel quote", `trade_cancel_${id}`)],
+            ])
+          );
+        } catch (err) {
+          console.error(`[trade] quote failed for user ${ctx.from!.id}:`, err);
+          await ctx.reply(
+            `Couldn't create a trade quote: ${err instanceof Error ? err.message : "unknown error"}.`,
+            Markup.inlineKeyboard([[Markup.button.callback("Trade menu", "home_trade")], [Markup.button.callback("Home", "home")]])
+          );
+        }
         return;
       }
 
@@ -623,17 +1141,24 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       }
 
       if (pendingInput.kind === "copy_ratio") {
-        const ratio = Number(input);
-        if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) return keepPrompt("Enter a size ratio from 0 to 1.");
-        pendingInputs.set(ctx.from!.id, { kind: "copy_max", ratio });
+        if (!/^\d+(?:\.\d+)?$/.test(input)) return keepPrompt("Enter a size ratio from 0 to 1.");
+        let ratioUnits: bigint;
+        try {
+          ratioUnits = parseUnitsExact(input, 18);
+        } catch {
+          return keepPrompt("Enter a size ratio from 0 to 1 with at most 18 fractional digits.");
+        }
+        if (ratioUnits > 10n ** 18n) return keepPrompt("Enter a size ratio from 0 to 1.");
+        pendingInputs.set(ctx.from!.id, { kind: "copy_max", ratio: input });
         await ctx.reply("Send the maximum amount per copied trade.", cancelPromptKeyboard);
         return;
       }
 
       if (pendingInput.kind === "copy_max") {
+        if (!isPositiveDecimal(input, 9)) return keepPrompt("Enter a positive maximum amount with at most 9 fractional digits.");
         const maxAmount = Number(input);
-        if (!Number.isFinite(maxAmount) || maxAmount <= 0) return keepPrompt("Enter a positive maximum amount.");
-        pendingInputs.set(ctx.from!.id, { kind: "copy_sells", ratio: pendingInput.ratio, maxAmount });
+        if (!Number.isFinite(maxAmount)) return keepPrompt("That maximum amount is outside the supported range.");
+        pendingInputs.set(ctx.from!.id, { kind: "copy_sells", ratio: pendingInput.ratio, maxAmount: input });
         await ctx.reply(
           "Should copied sells be enabled?",
           Markup.inlineKeyboard([
@@ -664,14 +1189,23 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
             nextStep = "amount";
             break;
           case "amount":
-            values.amount = Number(input);
-            if (!Number.isFinite(values.amount) || values.amount <= 0) return keepPrompt("Enter a positive amount.");
+            if (!isPositiveDecimal(input, pendingInput.side === "buy" ? pendingInput.chain === "solana" ? 9 : 18 : 255)) {
+              return keepPrompt("Enter a positive amount with supported decimal precision.");
+            }
+            values.amount = input;
             nextStep = pendingInput.side === "sell" ? "decimals" : "direction";
             break;
           case "decimals":
             values.decimals = Number(input);
             if (!Number.isInteger(values.decimals) || values.decimals < 0 || values.decimals > 255) {
               return keepPrompt("Enter token decimals as a whole number from 0 to 255.");
+            }
+            try {
+              if (parseUnitsExact(values.amount!, values.decimals) <= 0n) {
+                return keepPrompt(`The sell amount must fit within ${values.decimals} token decimals.`);
+              }
+            } catch {
+              return keepPrompt(`The sell amount must fit within ${values.decimals} token decimals.`);
             }
             nextStep = "direction";
             break;
@@ -751,7 +1285,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       return ctx.reply(
         `No ${chain} wallets yet.`,
         Markup.inlineKeyboard([
-          [Markup.button.callback("🔑 Import Wallet", "wallets_import"), Markup.button.callback("⚙️ Generate Wallet", "wallets_new")],
+          [Markup.button.callback("🔑 Import Wallet", "wallets_import")],
           [Markup.button.callback("↩️ Return", "wallets_return")],
         ])
       );
@@ -782,7 +1316,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         : Markup.button.callback("Set primary", `setprimary_${chain}_${w.label}`),
       Markup.button.callback("🗑️ Erase", `werase_ask_${chain}_${w.label}`),
     ]);
-    rows.push([Markup.button.callback("🔑 Import Wallet", "wallets_import"), Markup.button.callback("⚙️ Generate Wallet", "wallets_new")]);
+    rows.push([Markup.button.callback("🔑 Import Wallet", "wallets_import")]);
     rows.push([Markup.button.callback("↩️ Return", "wallets_return")]);
 
     ctx.reply(lines.join("\n"), Markup.inlineKeyboard(rows));
@@ -927,7 +1461,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   bot.command("snipe_on", (ctx) => {
     updateUserSettings(db, String(ctx.from!.id), { snipe_enabled: 1 });
     const u = getUser(db, String(ctx.from!.id))!;
-    ctx.reply(`Auto-buy enabled. Snipe size: ${u.snipe_size_sol} SOL / ${u.snipe_size_eth} ETH (change with /snipe_size). Trades from your primary wallet.`);
+    ctx.reply(`Auto-buy enabled. Snipe size: ${u.snipe_size_sol_exact} SOL / ${u.snipe_size_eth_exact} ETH. Trades from your primary wallet.`);
   });
 
   bot.command("snipe_off", (ctx) => {
@@ -937,10 +1471,23 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   bot.command("snipe_size", (ctx) => {
     const [, chain, amount] = ctx.message.text.split(" ");
-    if ((chain !== "solana" && chain !== "evm") || !amount || isNaN(Number(amount))) {
+    if (chain !== "solana" && chain !== "evm") {
       return ctx.reply("Usage: /snipe_size <solana|evm> <amount>");
     }
-    updateUserSettings(db, String(ctx.from!.id), chain === "solana" ? { snipe_size_sol: Number(amount) } : { snipe_size_eth: Number(amount) });
+    const decimals = chain === "solana" ? 9 : 18;
+    const cap = chain === "solana" ? tradingLimits.maxTradeSol : tradingLimits.maxTradeEth;
+    if (!amount || !isPositiveDecimal(amount, decimals) || parseUnitsExact(amount, decimals) > parseUnitsExact(cap, decimals)) {
+      return ctx.reply(`Enter a positive ${chain === "solana" ? "SOL" : "ETH"} amount no greater than ${cap}.`);
+    }
+    const numericAmount = Number(amount);
+    if (!Number.isFinite(numericAmount)) return ctx.reply("That amount is outside the supported range.");
+    updateUserSettings(
+      db,
+      String(ctx.from!.id),
+      chain === "solana"
+        ? { snipe_size_sol: numericAmount, snipe_size_sol_exact: amount }
+        : { snipe_size_eth: numericAmount, snipe_size_eth_exact: amount }
+    );
     ctx.reply(`Snipe size for ${chain} set to ${amount}.`);
   });
 
@@ -967,12 +1514,29 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   bot.command("copytrade_config", (ctx) => {
     const [, sizeRatio, maxAmount, copySells] = ctx.message.text.split(" ");
-    if (!sizeRatio || !maxAmount || (copySells !== "0" && copySells !== "1")) {
+    if (
+      !sizeRatio ||
+      !maxAmount ||
+      (copySells !== "0" && copySells !== "1") ||
+      !/^\d+(?:\.\d+)?$/.test(sizeRatio) ||
+      !isPositiveDecimal(maxAmount, 9)
+    ) {
       return ctx.reply("Usage: /copytrade_config <sizeRatio 0-1> <maxAmount> <copySells:0|1>");
+    }
+    let ratioUnits: bigint;
+    try {
+      ratioUnits = parseUnitsExact(sizeRatio, 18);
+    } catch {
+      return ctx.reply("Size ratio must have no more than 18 fractional digits.");
+    }
+    if (ratioUnits > 10n ** 18n || !Number.isFinite(Number(maxAmount))) {
+      return ctx.reply("Size ratio must be between 0 and 1 and maxAmount must be within the supported range.");
     }
     updateUserSettings(db, String(ctx.from!.id), {
       copy_size_ratio: Number(sizeRatio),
+      copy_size_ratio_exact: sizeRatio,
       copy_max_amount: Number(maxAmount),
+      copy_max_amount_exact: maxAmount,
       copy_sells: Number(copySells),
     });
     ctx.reply("Copy-trade sizing updated.");
@@ -992,7 +1556,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           side: "buy",
           direction: direction as "above" | "below",
           triggerPrice: Number(triggerPrice),
-          amount: Number(amount),
+          amount,
         });
         return ctx.reply(`Order ${id} created: buy ${mint} for ${amount} SOL when price ${direction} ${triggerPrice}`);
       }
@@ -1005,7 +1569,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           side: "buy",
           direction: direction as "above" | "below",
           triggerPrice: Number(triggerPrice),
-          amount: Number(amount),
+          amount,
         });
         return ctx.reply(`Order ${id} created: buy ${tokenAddress} for ${amount} ETH when price ${direction} ${triggerPrice}`);
       }
@@ -1029,7 +1593,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           side: "sell",
           direction: direction as "above" | "below",
           triggerPrice: Number(triggerPrice),
-          amount: Number(amount),
+          amount,
           decimals: Number(decimals),
         });
         return ctx.reply(`Order ${id} created: sell ${amount} of ${mint} when price ${direction} ${triggerPrice}`);
@@ -1043,7 +1607,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           side: "sell",
           direction: direction as "above" | "below",
           triggerPrice: Number(triggerPrice),
-          amount: Number(amount),
+          amount,
           decimals: Number(decimals),
         });
         return ctx.reply(`Order ${id} created: sell ${amount} of ${tokenAddress} when price ${direction} ${triggerPrice}`);
@@ -1056,7 +1620,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   bot.command("orders", (ctx) => {
     const rows = db
-      .prepare(`SELECT id, chain, identifier, side, direction, trigger_price, amount, status FROM limit_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`)
+      .prepare(`SELECT id, chain, identifier, side, direction, trigger_price, COALESCE(amount_exact, CAST(amount AS TEXT)) AS amount, status FROM limit_orders WHERE user_id = ? ORDER BY created_at DESC LIMIT 20`)
       .all(String(ctx.from!.id)) as any[];
     if (rows.length === 0) return ctx.reply("No orders yet.");
     const lines = rows.map(

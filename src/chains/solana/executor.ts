@@ -8,6 +8,8 @@ import {
 } from "@solana/web3.js";
 import { TxVersion, toBN } from "@raydium-io/raydium-sdk-v2";
 import { getRaydium } from "./raydiumClient.js";
+import bs58 from "bs58";
+import type { TradeLifecycleObserver } from "../../transactions/types.js";
 
 const WSOL_MINT = "So11111111111111111111111111111111111111";
 
@@ -27,10 +29,15 @@ interface BaseParams {
 
 export interface BuyParams extends BaseParams {
   amountInLamports: bigint; // SOL spent, raw lamports
+  assertCanSubmit?: () => void;
+  approvedMinimumOut?: bigint;
+  onLifecycleEvent?: TradeLifecycleObserver;
 }
 
 export interface SellParams extends BaseParams {
   amountInTokenBaseUnits: bigint; // token sold, raw base units (caller applies decimals)
+  approvedMinimumOut?: bigint;
+  onLifecycleEvent?: TradeLifecycleObserver;
 }
 
 /**
@@ -50,7 +57,8 @@ async function buildSwapTransactions(
   poolId: string,
   inputMint: string,
   amountIn: bigint,
-  slippageBps: number
+  slippageBps: number,
+  approvedMinimumOut?: bigint
 ): Promise<VersionedTransaction[]> {
   const raydium = await getRaydium(connection, wallet);
   const { poolInfo } = await raydium.liquidity.getPoolInfoFromRpc({ poolId });
@@ -58,13 +66,20 @@ async function buildSwapTransactions(
   const outputMint = poolInfo.mintA.address === inputMint ? poolInfo.mintB.address : poolInfo.mintA.address;
   const amountInBn = toBN(amountIn.toString());
 
-  const { minAmountOut } = raydium.liquidity.computeAmountOut({
+  const { minAmountOut: currentMinimumOut } = raydium.liquidity.computeAmountOut({
     poolInfo,
     amountIn: amountInBn,
     mintIn: inputMint,
     mintOut: outputMint,
     slippage: slippageBps / 10_000,
   });
+  const currentMinimum = BigInt(currentMinimumOut.toString());
+  if (approvedMinimumOut !== undefined && currentMinimum < approvedMinimumOut) {
+    throw new Error("Price moved below the confirmed minimum output. Request a fresh quote.");
+  }
+  const minAmountOut = approvedMinimumOut !== undefined && approvedMinimumOut > currentMinimum
+    ? toBN(approvedMinimumOut.toString())
+    : currentMinimumOut;
 
   const { transaction } = await raydium.liquidity.swap({
     poolInfo,
@@ -77,6 +92,61 @@ async function buildSwapTransactions(
   });
 
   return [transaction];
+}
+
+export interface SwapQuote {
+  outputMint: string;
+  outputDecimals: number;
+  expectedAmountOut: bigint;
+  minimumAmountOut: bigint;
+}
+
+async function getSwapQuote(
+  connection: Connection,
+  wallet: Keypair,
+  poolId: string,
+  inputMint: string,
+  amountIn: bigint,
+  slippageBps: number
+): Promise<SwapQuote> {
+  const raydium = await getRaydium(connection, wallet);
+  const { poolInfo } = await raydium.liquidity.getPoolInfoFromRpc({ poolId });
+  const inputIsA = poolInfo.mintA.address === inputMint;
+  const inputIsB = poolInfo.mintB.address === inputMint;
+  if (!inputIsA && !inputIsB) throw new Error("The input mint is not part of this pool.");
+  const output = inputIsA ? poolInfo.mintB : poolInfo.mintA;
+  const { amountOut, minAmountOut } = raydium.liquidity.computeAmountOut({
+    poolInfo,
+    amountIn: toBN(amountIn.toString()),
+    mintIn: inputMint,
+    mintOut: output.address,
+    slippage: slippageBps / 10_000,
+  });
+  return {
+    outputMint: output.address,
+    outputDecimals: Number(output.decimals),
+    expectedAmountOut: BigInt(amountOut.toString()),
+    minimumAmountOut: BigInt(minAmountOut.toString()),
+  };
+}
+
+export async function quoteBuy(
+  params: Omit<BuyParams, "assertCanSubmit" | "useJitoBundle" | "jitoTipLamports" | "approvedMinimumOut">
+): Promise<SwapQuote> {
+  return getSwapQuote(params.connection, params.wallet, params.poolId, WSOL_MINT, params.amountInLamports, params.slippageBps);
+}
+
+export async function quoteSell(params: SellParams & { tokenMint: string }): Promise<SwapQuote> {
+  const quote = await getSwapQuote(
+    params.connection,
+    params.wallet,
+    params.poolId,
+    params.tokenMint,
+    params.amountInTokenBaseUnits,
+    params.slippageBps
+  );
+  if (quote.outputMint !== WSOL_MINT) throw new Error("This sell pool does not trade the selected token against SOL.");
+  return quote;
 }
 
 function buildTipTransaction(
@@ -122,28 +192,41 @@ async function signAndSend(
   wallet: Keypair,
   swapTxs: VersionedTransaction[],
   useJitoBundle: boolean,
-  jitoTipLamports: number
+  jitoTipLamports: number,
+  assertCanSubmit?: () => void,
+  onLifecycleEvent?: TradeLifecycleObserver
 ): Promise<string> {
+  assertCanSubmit?.();
   swapTxs.forEach((tx) => tx.sign([wallet]));
 
   if (useJitoBundle) {
     const { blockhash } = await connection.getLatestBlockhash("confirmed");
     const tipTx = buildTipTransaction(wallet, blockhash, jitoTipLamports);
-    return sendViaJitoBundle([...swapTxs, tipTx]);
+    assertCanSubmit?.();
+    const transactionRef = bs58.encode(swapTxs[0].signatures[0]);
+    onLifecycleEvent?.({ phase: "submitted", kind: "swap", transactionRef });
+    const bundleRef = await sendViaJitoBundle([...swapTxs, tipTx]);
+    onLifecycleEvent?.({ phase: "submitted", kind: "swap", transactionRef, bundleRef });
+    return bundleRef;
   }
 
   let lastSig = "";
   for (const tx of swapTxs) {
+    assertCanSubmit?.();
+    const transactionRef = bs58.encode(tx.signatures[0]);
+    onLifecycleEvent?.({ phase: "submitted", kind: "swap", transactionRef });
     lastSig = await connection.sendTransaction(tx);
   }
-  await connection.confirmTransaction(lastSig, "confirmed");
+  const confirmation = await connection.confirmTransaction(lastSig, "confirmed");
+  if (confirmation.value.err) throw new Error(`Solana transaction failed: ${JSON.stringify(confirmation.value.err)}`);
+  onLifecycleEvent?.({ phase: "confirmed", kind: "swap", transactionRef: lastSig });
   return lastSig;
 }
 
 export async function executeBuy(params: BuyParams): Promise<string> {
-  const { connection, wallet, poolId, amountInLamports, slippageBps, useJitoBundle = true, jitoTipLamports = 100_000 } = params;
-  const swapTxs = await buildSwapTransactions(connection, wallet, poolId, WSOL_MINT, amountInLamports, slippageBps);
-  return signAndSend(connection, wallet, swapTxs, useJitoBundle, jitoTipLamports);
+  const { connection, wallet, poolId, amountInLamports, slippageBps, useJitoBundle = true, jitoTipLamports = 100_000, assertCanSubmit, approvedMinimumOut, onLifecycleEvent } = params;
+  const swapTxs = await buildSwapTransactions(connection, wallet, poolId, WSOL_MINT, amountInLamports, slippageBps, approvedMinimumOut);
+  return signAndSend(connection, wallet, swapTxs, useJitoBundle, jitoTipLamports, assertCanSubmit, onLifecycleEvent);
 }
 
 /**
@@ -152,7 +235,7 @@ export async function executeBuy(params: BuyParams): Promise<string> {
  * passes the token amount being sold — no need to know pool ordering.
  */
 export async function executeSell(params: SellParams): Promise<string> {
-  const { connection, wallet, poolId, amountInTokenBaseUnits, slippageBps, useJitoBundle = true, jitoTipLamports = 100_000 } = params;
+  const { connection, wallet, poolId, amountInTokenBaseUnits, slippageBps, useJitoBundle = true, jitoTipLamports = 100_000, approvedMinimumOut, onLifecycleEvent } = params;
   const raydium = await getRaydium(connection, wallet);
   const { poolInfo } = await raydium.liquidity.getPoolInfoFromRpc({ poolId });
   const tokenMint = poolInfo.mintA.address === WSOL_MINT ? poolInfo.mintB.address : poolInfo.mintA.address;
@@ -163,7 +246,8 @@ export async function executeSell(params: SellParams): Promise<string> {
     poolId,
     tokenMint,
     amountInTokenBaseUnits,
-    slippageBps
+    slippageBps,
+    approvedMinimumOut
   );
-  return signAndSend(connection, wallet, swapTxs, useJitoBundle, jitoTipLamports);
+  return signAndSend(connection, wallet, swapTxs, useJitoBundle, jitoTipLamports, undefined, onLifecycleEvent);
 }

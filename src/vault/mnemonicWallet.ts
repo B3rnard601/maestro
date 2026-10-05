@@ -17,12 +17,6 @@ export interface DerivedWallets {
   evm: { address: string; privateKey: string };
 }
 
-/** Generates a new 12-word seed phrase and derives both chains' keys from it. */
-export function generateMnemonicWallets(): DerivedWallets {
-  const mnemonic = bip39.generateMnemonic(); // 128-bit entropy → 12 words
-  return deriveFromMnemonic(mnemonic);
-}
-
 /** Derives both chains' keys from an existing seed phrase (import path). */
 export function deriveFromMnemonic(mnemonic: string): DerivedWallets {
   const trimmed = mnemonic.trim().toLowerCase();

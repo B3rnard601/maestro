@@ -23,6 +23,10 @@ Fill in `.env`:
 - `TELEGRAM_OWNER_ID` — your numeric Telegram id, promotes you to admin on first contact (see the comment in `.env.example` for what this does and doesn't gate)
 - `SOLANA_RPC_HTTP` / `SOLANA_RPC_WSS` — your Helius/Triton endpoints
 - `EVM_RPC_HTTP` / `EVM_RPC_WSS` — your Alchemy/Infura endpoints
+- `MAX_TRADE_SOL` / `MAX_TRADE_ETH` — hard maximum spend for each buy, defaulting to `0.1` SOL / `0.05` ETH. These caps are applied to auto-buy, copy-trading, and limit buys. They are live-mainnet controls, not investment recommendations.
+- `MAX_SLIPPAGE_BPS` — slippage used for swaps, from 1 to 500 basis points (default `500`).
+- `TRADE_QUOTE_TTL_SECONDS` — expiry for button-driven manual trade previews (10–300 seconds, default `60`). Confirmation is one-use and rechecks the minimum output before signing.
+- Trade lifecycle records are stored in the bot SQLite database. EVM receipts and Solana finalized signatures are reconciled in the background; trades without a final status after 15 minutes are marked `unknown` and continue to be checked. Use **Recent trades** in Telegram to inspect tracked executions.
 - `VAULT_MASTER_KEY` — generate one, don't reuse across environments:
 
 ```bash
@@ -35,7 +39,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 npm run dev
 ```
 
-Message your bot on Telegram — you're auto-registered on first contact. If your id matches `TELEGRAM_OWNER_ID` you're promoted to admin and auto-approved; otherwise you land in `pending` and need to approve yourself via the other account, or just make sure `TELEGRAM_OWNER_ID` is your own id before testing. Once active: `/wallets` → New Wallet (or Import), fund the address, then `/snipe_on` or create limit orders. Every other Telegram user who messages the bot goes through the same pending → approved flow before any of that responds for them — see the operational checklist below.
+Message your bot on Telegram — you're auto-registered on first contact. If your id matches `TELEGRAM_OWNER_ID` you're promoted to admin and auto-approved; otherwise you land in `pending` and need to approve yourself via the other account, or just make sure `TELEGRAM_OWNER_ID` is your own id before testing. Once active, use `/wallets` → Import Wallet, fund the imported address, then `/snipe_on` or create limit orders. Every other Telegram user who messages the bot goes through the same pending → approved flow before any of that responds for them — see the operational checklist below.
 
 ## Admin app
 
@@ -132,6 +136,7 @@ Latency to your RPC and to the Jito block engine/Flashbots relay is the entire g
 2. **Set `ADMIN_PASSWORD` and `ADMIN_JWT_SECRET`** for the admin server — long random values, not something guessable. The admin dashboard can ban users and cancel anyone's orders.
 3. Auto-buy defaults to off per user (`snipe_enabled = 0`) — each user opts in with `/snipe_on` deliberately, not on registration.
 4. Watch console logs for a while first (`[SOL] safety check for ... safe=...`) to see real pass/fail rates before anyone risks funds.
-5. Snipe size is per-user now (`/snipe_size solana|evm <amount>`, defaults 0.1 SOL / 0.05 ETH) — no shared global size anymore.
-6. **Wallet import and secret reveal both put a secret into the Telegram chat as text.** Import: the bot deletes your message immediately after processing. Reveal (`/wallets` → My Wallets → a wallet → "Reveal secret"): requires a confirmation tap first, then auto-deletes its own message after 60 seconds. Either way, the secret briefly exists in Telegram's server-side chat log regardless of the auto-delete — that's a property of Telegram, not something client-side deletion can fully undo. Prefer "New Wallet" (generated in-vault, key never transits Telegram) over import when you don't specifically need to bring an existing wallet in, and treat "Reveal secret" as something to use sparingly, not routinely.
-7. **Seed phrases are stored encrypted in `vault.json`, never in `bot.db`.** Wallet rows in SQLite hold public addresses and labels; wallet-import audit events retain only user ID, username, wallet label, and chain. No database record contains a signable secret. Keep `VAULT_MASTER_KEY` at least as protected as the database itself; it's what makes the vault file unreadable without it. Successful wallet imports are recorded in the admin dashboard and sent to `TELEGRAM_OWNER_ID`; seed phrases and private keys are never included.
+5. Snipe size is per-user now (defaults 0.1 SOL / 0.05 ETH), but no buy may exceed the global `MAX_TRADE_SOL` / `MAX_TRADE_ETH` cap.
+6. **Wallet import and secret reveal both put a secret into the Telegram chat as text.** Import: the bot deletes your message immediately after processing. Reveal (`/wallets` → My Wallets → a wallet → "Reveal secret"): requires a confirmation tap first, then auto-deletes its own message after 60 seconds. Either way, the secret briefly exists in Telegram's server-side chat log regardless of the auto-delete — that's a property of Telegram, not something client-side deletion can fully undo. Treat "Reveal secret" as something to use sparingly, not routinely.
+7. **Seed phrases are stored encrypted in `vault.json`, never in `bot.db`.** Wallet rows in SQLite hold public addresses and labels; wallet-import audit events retain only user ID, username, wallet label, and chain. On startup, older wallet-import event rows are redacted to remove any previously retained key material. Keep `VAULT_MASTER_KEY` at least as protected as the database itself; it's what makes the vault file unreadable without it. Successful wallet imports are recorded without secrets.
+8. The Admin menu's kill switch pauses all new buys (auto-buy, copy-trading, and limit buys); sells and exit orders remain enabled. Open buy limit orders stay queued and may execute after the switch is disabled. Changes and risk-policy decisions are written to the local SQLite audit log, visible from Admin → Recent risk audit.

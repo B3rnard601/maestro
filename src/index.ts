@@ -1,6 +1,7 @@
 import "dotenv/config";
 import dns from "node:dns";
 import { Wallet as EvmWallet } from "ethers";
+import { loadConfig } from "./config/env.js";
 import { WalletVault } from "./vault/wallet-vault.js";
 import { getPrimarySolanaKeypair, getPrimaryEvmWallet } from "./vault/walletHelpers.js";
 import { createBot } from "./bot/telegram.js";
@@ -18,6 +19,10 @@ import { CopyTradeRegistry } from "./copytrade/registry.js";
 import { scaleTrade } from "./copytrade/engine.js";
 import { openDb, recordHolding, listActiveSnipers } from "./db/db.js";
 import { startLimitOrderEngine } from "./orders/limitOrderEngine.js";
+import { assertBuyEntryEnabled, evaluateTradePolicy } from "./risk/policy.js";
+import { formatUnitsExact, parseUnitsExact } from "./shared/amount.js";
+import { beginTrackedTrade } from "./transactions/tracker.js";
+import { startTradeReconciler } from "./transactions/reconciler.js";
 
 /**
  * Many ISPs hand out IPv6 addresses that don't route well internationally.
@@ -34,13 +39,18 @@ const WSOL_MINT = "So11111111111111111111111111111111111111";
 const WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
 
 async function main() {
-  const vault = new WalletVault(process.env.VAULT_MASTER_KEY!, "./data/vault.json");
+  const config = loadConfig();
+  console.info(
+    `[risk] max buy size: ${config.maxTradeSol} SOL / ${config.maxTradeEth} ETH; max slippage: ${config.maxSlippageBps} bps`
+  );
+  const vault = new WalletVault(config.vaultMasterKey, "./data/vault.json");
   const db = openDb();
 
   const solConn = getSolanaConnection();
   const evmProvider = getEvmWsProvider();
   const evmHttp = getEvmHttpProvider();
   const simWallet = EvmWallet.createRandom().address; // no funds needed — safety checks use state overrides
+  startTradeReconciler(db, solConn, evmHttp);
 
   // --- Solana new-pool detection: safety check, then fan out to every active sniper ---
   startPoolListener(solConn, async (event) => {
@@ -68,12 +78,31 @@ async function main() {
       const wallet = getPrimarySolanaKeypair(vault, db, user.telegram_id);
       if (!wallet) continue; // enabled sniping before creating a wallet — nothing to do until they do
       try {
+        const amount = user.snipe_size_sol_exact ?? String(user.snipe_size_sol);
+        const decision = evaluateTradePolicy(db, config, {
+          userId: user.telegram_id,
+          chain: "solana",
+          side: "buy",
+          amount,
+          source: "sniper",
+        });
+        if (!decision.allowed) continue;
+        const lifecycle = beginTrackedTrade(db, {
+          userId: user.telegram_id,
+          chain: "solana",
+          side: "buy",
+          source: "sniper",
+          asset: mint,
+          amount,
+        });
         await executeSolanaBuy({
           connection: solConn,
           wallet,
           poolId: keys.poolId,
-          amountInLamports: BigInt(Math.floor(user.snipe_size_sol * 1e9)),
-          slippageBps: 500,
+          amountInLamports: parseUnitsExact(amount, 9),
+          slippageBps: decision.maxSlippageBps,
+          assertCanSubmit: () => assertBuyEntryEnabled(db, user.telegram_id, "solana", "sniper"),
+          onLifecycleEvent: lifecycle.observe,
         });
       } catch (err) {
         console.error(`[SOL] snipe buy failed for user ${user.telegram_id}:`, err);
@@ -82,7 +111,7 @@ async function main() {
   });
 
   // --- EVM new-pair detection: safety check, then fan out to every active sniper ---
-  startPairListener(evmProvider, process.env.UNISWAP_V2_FACTORY!, async (event) => {
+  startPairListener(evmProvider, config.uniswapV2Factory, async (event) => {
     console.log(`[EVM] new pair: ${event.pair} (${event.token0}/${event.token1})`);
     const newToken = event.token0.toLowerCase() === WETH.toLowerCase() ? event.token1 : event.token0;
 
@@ -95,12 +124,31 @@ async function main() {
       const wallet = getPrimaryEvmWallet(vault, db, user.telegram_id);
       if (!wallet) continue;
       try {
+        const amount = user.snipe_size_eth_exact ?? String(user.snipe_size_eth);
+        const decision = evaluateTradePolicy(db, config, {
+          userId: user.telegram_id,
+          chain: "evm",
+          side: "buy",
+          amount,
+          source: "sniper",
+        });
+        if (!decision.allowed) continue;
+        const lifecycle = beginTrackedTrade(db, {
+          userId: user.telegram_id,
+          chain: "evm",
+          side: "buy",
+          source: "sniper",
+          asset: newToken,
+          amount,
+        });
         await executeEvmBuy({
           provider: evmHttp,
           wallet,
           tokenAddress: newToken,
-          amountInEth: String(user.snipe_size_eth),
-          slippageBps: 500,
+          amountInEth: amount,
+          slippageBps: decision.maxSlippageBps,
+          assertCanSubmit: () => assertBuyEntryEnabled(db, user.telegram_id, "evm", "sniper"),
+          onLifecycleEvent: lifecycle.observe,
         });
         recordHolding(db, "evm", user.telegram_id, newToken);
       } catch (err) {
@@ -115,28 +163,54 @@ async function main() {
     solConn,
     evmProvider,
     async (target, followers, trade) => {
+      const solDelta = BigInt(trade.solChangeLamports);
+      const targetSpend = formatUnitsExact(solDelta < 0n ? -solDelta : solDelta, 9);
       for (const user of followers) {
         const scaled = scaleTrade(
-          { targetWallet: target, sizeRatio: user.copy_size_ratio, maxAmountPerTrade: user.copy_max_amount, copySells: !!user.copy_sells },
-          Math.abs(trade.solChange),
+          {
+            targetWallet: target,
+            sizeRatio: user.copy_size_ratio_exact ?? String(user.copy_size_ratio),
+            maxAmountPerTrade: user.copy_max_amount_exact ?? String(user.copy_max_amount),
+            copySells: !!user.copy_sells,
+          },
+          targetSpend,
           trade.side,
           trade.mint,
-          trade.signature
+          trade.signature,
+          9
         );
         if (!scaled || scaled.action !== "buy") continue;
 
         const wallet = getPrimarySolanaKeypair(vault, db, user.telegram_id);
         if (!wallet) continue;
         try {
+          const decision = evaluateTradePolicy(db, config, {
+            userId: user.telegram_id,
+            chain: "solana",
+            side: "buy",
+            amount: scaled.amount,
+            source: "copytrade",
+          });
+          if (!decision.allowed) continue;
           const raydium = await getRaydium(solConn, wallet);
           const poolId = await getPoolIdByMint(raydium, scaled.identifier);
           if (!poolId) continue;
+          const lifecycle = beginTrackedTrade(db, {
+            userId: user.telegram_id,
+            chain: "solana",
+            side: "buy",
+            source: "copytrade",
+            asset: scaled.identifier,
+            amount: scaled.amount,
+          });
           await executeSolanaBuy({
             connection: solConn,
             wallet,
             poolId,
-            amountInLamports: BigInt(Math.floor(scaled.amount * 1e9)),
-            slippageBps: 500,
+            amountInLamports: parseUnitsExact(scaled.amount, 9),
+            slippageBps: decision.maxSlippageBps,
+            assertCanSubmit: () => assertBuyEntryEnabled(db, user.telegram_id, "solana", "copytrade"),
+            onLifecycleEvent: lifecycle.observe,
           });
         } catch (err) {
           console.error(`[copytrade/sol] buy failed for user ${user.telegram_id}:`, err);
@@ -144,28 +218,52 @@ async function main() {
       }
     },
     async (target, followers, trade) => {
-      const ethAmount = Number(trade.ethAmount) / 1e18;
+      const ethAmount = formatUnitsExact(BigInt(trade.ethAmount), 18);
       for (const user of followers) {
         const scaled = scaleTrade(
-          { targetWallet: target, sizeRatio: user.copy_size_ratio, maxAmountPerTrade: user.copy_max_amount, copySells: !!user.copy_sells },
+          {
+            targetWallet: target,
+            sizeRatio: user.copy_size_ratio_exact ?? String(user.copy_size_ratio),
+            maxAmountPerTrade: user.copy_max_amount_exact ?? String(user.copy_max_amount),
+            copySells: !!user.copy_sells,
+          },
           ethAmount,
           trade.side,
           trade.tokenAddress,
-          trade.txHash
+          trade.txHash,
+          18
         );
         if (!scaled || scaled.action !== "buy") continue;
 
         const wallet = getPrimaryEvmWallet(vault, db, user.telegram_id);
         if (!wallet) continue;
         try {
+          const decision = evaluateTradePolicy(db, config, {
+            userId: user.telegram_id,
+            chain: "evm",
+            side: "buy",
+            amount: scaled.amount,
+            source: "copytrade",
+          });
+          if (!decision.allowed) continue;
           const result = await runEvmSafetyChecks(evmHttp, scaled.identifier, simWallet);
           if (!result.safe) continue;
+          const lifecycle = beginTrackedTrade(db, {
+            userId: user.telegram_id,
+            chain: "evm",
+            side: "buy",
+            source: "copytrade",
+            asset: scaled.identifier,
+            amount: scaled.amount,
+          });
           await executeEvmBuy({
             provider: evmHttp,
             wallet,
             tokenAddress: scaled.identifier,
-            amountInEth: String(scaled.amount),
-            slippageBps: 500,
+            amountInEth: scaled.amount,
+            slippageBps: decision.maxSlippageBps,
+            assertCanSubmit: () => assertBuyEntryEnabled(db, user.telegram_id, "evm", "copytrade"),
+            onLifecycleEvent: lifecycle.observe,
           });
           recordHolding(db, "evm", user.telegram_id, scaled.identifier);
         } catch (err) {
@@ -183,11 +281,26 @@ async function main() {
     loadSolWallet: (userId) => getPrimarySolanaKeypair(vault, db, userId),
     evmProvider: evmHttp,
     loadEvmWallet: (userId) => getPrimaryEvmWallet(vault, db, userId),
-    evmFactoryAddress: process.env.UNISWAP_V2_FACTORY!,
+    evmFactoryAddress: config.uniswapV2Factory,
+    config,
   });
 
   // --- Telegram control surface ---
-  const bot = createBot(process.env.TELEGRAM_BOT_TOKEN!, { vault, db, copyRegistry, solConnection: solConn, evmProvider });
+  const bot = createBot(config.telegramBotToken, {
+    vault,
+    db,
+    copyRegistry,
+    solConnection: solConn,
+    evmProvider,
+    adminBootstrapId: config.telegramOwnerId,
+    tradingLimits: {
+      maxTradeSol: config.maxTradeSol,
+      maxTradeEth: config.maxTradeEth,
+      maxSlippageBps: config.maxSlippageBps,
+      tradeQuoteTtlSeconds: config.tradeQuoteTtlSeconds,
+    },
+    evmHttpProvider: evmHttp,
+  });
   await launchWithRetry(bot);
   console.log("maestro running.");
 }
