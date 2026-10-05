@@ -33,6 +33,7 @@ export interface EvmSellParams {
   amountInTokenBaseUnits: bigint; // raw units, caller applies token decimals
   slippageBps: number; // e.g. 500 = 5%
   usePrivateRelay?: boolean;
+  assertCanSubmit?: () => void;
   approvedMinimumOut?: bigint;
   confirmedRequiresApproval?: boolean;
   onLifecycleEvent?: TradeLifecycleObserver;
@@ -161,6 +162,7 @@ export async function executeSell(params: EvmSellParams): Promise<string> {
     amountInTokenBaseUnits,
     slippageBps,
     usePrivateRelay = true,
+    assertCanSubmit,
     approvedMinimumOut,
     confirmedRequiresApproval,
     onLifecycleEvent,
@@ -210,10 +212,12 @@ export async function executeSell(params: EvmSellParams): Promise<string> {
       }
     );
 
+  assertCanSubmit?.();
   const signedTx = await signer.signTransaction(txRequest);
   const transactionRef = keccak256(signedTx);
 
   if (usePrivateRelay) {
+    assertCanSubmit?.();
     onLifecycleEvent?.({ phase: "submitted", kind: "swap", transactionRef });
     const relayHash = await sendViaPrivateRelay(signedTx);
     if (relayHash.toLowerCase() !== transactionRef.toLowerCase()) {
@@ -222,6 +226,7 @@ export async function executeSell(params: EvmSellParams): Promise<string> {
     return relayHash;
   }
 
+  assertCanSubmit?.();
   onLifecycleEvent?.({ phase: "submitted", kind: "swap", transactionRef });
   const sent = await provider.broadcastTransaction(signedTx);
   await sent.wait();

@@ -18,7 +18,7 @@ import { scaleTrade } from "./copytrade/engine.js";
 import { openDb, listActiveSnipers } from "./db/db.js";
 import { startLimitOrderEngine } from "./orders/limitOrderEngine.js";
 import { evaluateTradePolicy } from "./risk/policy.js";
-import { formatUnitsExact } from "./shared/amount.js";
+import { formatUnitsExact, parseUnitsExact } from "./shared/amount.js";
 import { startTradeReconciler } from "./transactions/reconciler.js";
 import { enqueueAutomatedTrade, startTradeWorker } from "./transactions/worker.js";
 
@@ -38,6 +38,12 @@ const WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
 
 async function main() {
   const config = loadConfig();
+
+  function minimumAmount(values: string[], decimals: number): string {
+    return values.reduce((minimum, amount) =>
+      parseUnitsExact(amount, decimals) < parseUnitsExact(minimum, decimals) ? amount : minimum
+    );
+  }
   console.info(
     `[risk] max buy size: ${config.maxTradeSol} SOL / ${config.maxTradeEth} ETH; max slippage: ${config.maxSlippageBps} bps`
   );
@@ -155,7 +161,11 @@ async function main() {
           {
             targetWallet: target,
             sizeRatio: user.copy_size_ratio_exact ?? String(user.copy_size_ratio),
-            maxAmountPerTrade: user.copy_max_amount_exact ?? String(user.copy_max_amount),
+            maxAmountPerTrade: minimumAmount([
+              user.copy_max_amount_exact ?? String(user.copy_max_amount),
+              user.max_trade_sol_exact,
+              config.maxTradeSol,
+            ], 9),
             copySells: !!user.copy_sells,
           },
           targetSpend,
@@ -203,7 +213,11 @@ async function main() {
           {
             targetWallet: target,
             sizeRatio: user.copy_size_ratio_exact ?? String(user.copy_size_ratio),
-            maxAmountPerTrade: user.copy_max_amount_exact ?? String(user.copy_max_amount),
+            maxAmountPerTrade: minimumAmount([
+              user.copy_max_amount_exact ?? String(user.copy_max_amount),
+              user.max_trade_eth_exact,
+              config.maxTradeEth,
+            ], 18),
             copySells: !!user.copy_sells,
           },
           ethAmount,
@@ -277,6 +291,8 @@ async function main() {
     tradingLimits: {
       maxTradeSol: config.maxTradeSol,
       maxTradeEth: config.maxTradeEth,
+      maxDailySpendSol: config.maxDailySpendSol,
+      maxDailySpendEth: config.maxDailySpendEth,
       maxSlippageBps: config.maxSlippageBps,
       tradeQuoteTtlSeconds: config.tradeQuoteTtlSeconds,
     },

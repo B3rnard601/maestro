@@ -114,7 +114,7 @@ export interface EngineDeps {
 export function startLimitOrderEngine(deps: EngineDeps) {
   const { db, solConnection, loadSolWallet, evmProvider, loadEvmWallet, evmFactoryAddress, config } = deps;
   const pollIntervalMs = deps.pollIntervalMs ?? 5_000;
-  const auditedBlockedOrders = new Set<string>();
+  const auditedBlockedOrders = new Map<string, number>();
   const warnedFailedJobs = new Set<string>();
 
   const interval = setInterval(async () => {
@@ -136,7 +136,11 @@ export function startLimitOrderEngine(deps: EngineDeps) {
           continue;
         }
 
-        if (order.side === "buy" && auditedBlockedOrders.has(order.id)) continue;
+        const blockedUntil = auditedBlockedOrders.get(order.id);
+        if (order.side === "buy" && blockedUntil !== undefined) {
+          if (blockedUntil === Number.POSITIVE_INFINITY || blockedUntil > Date.now()) continue;
+          auditedBlockedOrders.delete(order.id);
+        }
         if (order.side === "buy" && getSystemControls(db).kill_switch_enabled) continue;
 
         const price =
@@ -158,7 +162,18 @@ export function startLimitOrderEngine(deps: EngineDeps) {
           source: "limit_order",
         });
         if (!decision.allowed) {
-          auditedBlockedOrders.add(order.id);
+          if (decision.reasons.includes("DAILY_SPEND_LIMIT_EXCEEDED")) {
+            const now = new Date();
+            auditedBlockedOrders.set(order.id, Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+          } else {
+            const cooldown = decision.reasons.find((reason) => reason.startsWith("COOLDOWN_ACTIVE:"));
+            if (cooldown) {
+              const remainingSeconds = Number(cooldown.slice("COOLDOWN_ACTIVE:".length).replace(/s$/, ""));
+              auditedBlockedOrders.set(order.id, Date.now() + Math.max(1, remainingSeconds) * 1000);
+            } else {
+              auditedBlockedOrders.set(order.id, Number.POSITIVE_INFINITY);
+            }
+          }
           continue;
         }
 

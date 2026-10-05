@@ -65,10 +65,14 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
         side: job.side,
         amount: job.amount,
         source: job.source,
+        jobId: job.id,
       });
       if (!decision.allowed) {
         if (decision.reasons.length === 1 && decision.reasons[0] === "KILL_SWITCH_ENABLED") {
           deferTradeJob(db, job.id, Date.now() + PAUSE_RECHECK_MS, "Buy entries paused by the admin kill switch.");
+        } else if (decision.reasons.length === 1 && decision.reasons[0].startsWith("COOLDOWN_ACTIVE:")) {
+          const remainingSeconds = Number(decision.reasons[0].slice("COOLDOWN_ACTIVE:".length).replace(/s$/, ""));
+          deferTradeJob(db, job.id, Date.now() + Math.max(1, remainingSeconds) * 1000, "User buy cooldown is active.");
         } else {
           setTradeJobStatus(db, job.id, "failed", { error: `Risk policy blocked execution: ${decision.reasons.join(", ")}` });
         }
@@ -109,7 +113,15 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
               poolId: job.pool_ref,
               amountInLamports: parseUnitsExact(job.amount, 9),
               slippageBps: decision.maxSlippageBps,
-              assertCanSubmit: () => assertBuyEntryEnabled(db, job.user_id, "solana", job.source),
+              assertCanSubmit: () => {
+                const latest = evaluateTradePolicy(db, config, {
+                  userId: job.user_id, chain: job.chain, side: "buy", amount: job.amount,
+                  source: job.source, jobId: job.id,
+                });
+                if (!latest.allowed) throw new Error(`Risk policy changed before submission: ${latest.reasons.join(", ")}.`);
+                if (latest.maxSlippageBps < decision.maxSlippageBps) throw new Error("Slippage ceiling changed before submission; retry the trade.");
+                assertBuyEntryEnabled(db, job.user_id, "solana", job.source);
+              },
               onLifecycleEvent: observe,
             });
           } else {
@@ -120,6 +132,12 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
               poolId: job.pool_ref,
               amountInTokenBaseUnits: parseUnitsExact(job.amount, job.decimals),
               slippageBps: decision.maxSlippageBps,
+              assertCanSubmit: () => {
+                const latest = evaluateTradePolicy(db, config, {
+                  userId: job.user_id, chain: job.chain, side: "sell", amount: job.amount, source: job.source,
+                });
+                if (latest.maxSlippageBps < decision.maxSlippageBps) throw new Error("Slippage ceiling changed before submission; retry the trade.");
+              },
               onLifecycleEvent: observe,
             });
           }
@@ -130,7 +148,15 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
             tokenAddress: job.asset,
             amountInEth: job.amount,
             slippageBps: decision.maxSlippageBps,
-            assertCanSubmit: () => assertBuyEntryEnabled(db, job.user_id, "evm", job.source),
+            assertCanSubmit: () => {
+              const latest = evaluateTradePolicy(db, config, {
+                userId: job.user_id, chain: job.chain, side: "buy", amount: job.amount,
+                source: job.source, jobId: job.id,
+              });
+              if (!latest.allowed) throw new Error(`Risk policy changed before submission: ${latest.reasons.join(", ")}.`);
+              if (latest.maxSlippageBps < decision.maxSlippageBps) throw new Error("Slippage ceiling changed before submission; retry the trade.");
+              assertBuyEntryEnabled(db, job.user_id, "evm", job.source);
+            },
             onLifecycleEvent: observe,
           });
           recordHolding(db, "evm", job.user_id, job.asset);
@@ -142,6 +168,12 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
             tokenAddress: job.asset,
             amountInTokenBaseUnits: parseUnitsExact(job.amount, job.decimals),
             slippageBps: decision.maxSlippageBps,
+            assertCanSubmit: () => {
+              const latest = evaluateTradePolicy(db, config, {
+                userId: job.user_id, chain: job.chain, side: "sell", amount: job.amount, source: job.source,
+              });
+              if (latest.maxSlippageBps < decision.maxSlippageBps) throw new Error("Slippage ceiling changed before submission; retry the trade.");
+            },
             onLifecycleEvent: observe,
           });
         }

@@ -14,6 +14,8 @@ export interface AppConfig {
   uniswapV2Factory: string;
   maxTradeSol: string;
   maxTradeEth: string;
+  maxDailySpendSol: string;
+  maxDailySpendEth: string;
   maxSlippageBps: number;
   tradeQuoteTtlSeconds: number;
 }
@@ -76,6 +78,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
   const maxTradeSol = readPositiveAmount(env, "MAX_TRADE_SOL", "0.1", 9, errors);
   const maxTradeEth = readPositiveAmount(env, "MAX_TRADE_ETH", "0.05", 18, errors);
+  const maxDailySpendSol = readPositiveAmount(env, "MAX_DAILY_SPEND_SOL", "1", 9, errors);
+  const maxDailySpendEth = readPositiveAmount(env, "MAX_DAILY_SPEND_ETH", "0.5", 18, errors);
   const maxSlippageBps = Number(env.MAX_SLIPPAGE_BPS ?? "500");
   if (!Number.isInteger(maxSlippageBps) || maxSlippageBps < 1 || maxSlippageBps > 500) {
     errors.push("MAX_SLIPPAGE_BPS must be an integer between 1 and 500.");
@@ -102,6 +106,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     uniswapV2Factory,
     maxTradeSol,
     maxTradeEth,
+    maxDailySpendSol,
+    maxDailySpendEth,
     maxSlippageBps,
     tradeQuoteTtlSeconds,
   };

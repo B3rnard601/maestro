@@ -55,6 +55,15 @@ export function isPositiveDecimal(value: string, decimals: number): boolean {
   }
 }
 
+export function isNonNegativeDecimal(value: string, decimals: number): boolean {
+  try {
+    parseUnitsExact(value, decimals);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function numberToDecimalString(value: number): string {
   if (!Number.isFinite(value)) throw new RangeError("Amount must be finite.");
   const source = value.toString();

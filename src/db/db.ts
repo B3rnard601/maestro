@@ -22,6 +22,12 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       snipe_size_sol_exact TEXT NOT NULL DEFAULT '0.1',
       snipe_size_eth REAL NOT NULL DEFAULT 0.05,
       snipe_size_eth_exact TEXT NOT NULL DEFAULT '0.05',
+      max_trade_sol_exact TEXT NOT NULL DEFAULT '0.1',
+      max_trade_eth_exact TEXT NOT NULL DEFAULT '0.05',
+      max_daily_spend_sol_exact TEXT NOT NULL DEFAULT '1',
+      max_daily_spend_eth_exact TEXT NOT NULL DEFAULT '0.5',
+      max_slippage_bps INTEGER NOT NULL DEFAULT 500,
+      cooldown_seconds INTEGER NOT NULL DEFAULT 0,
       copy_target TEXT,
       copy_size_ratio REAL NOT NULL DEFAULT 0.1,
       copy_size_ratio_exact TEXT NOT NULL DEFAULT '0.1',
@@ -170,6 +176,12 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
           snipe_size_sol_exact TEXT NOT NULL DEFAULT '0.1',
           snipe_size_eth REAL NOT NULL DEFAULT 0.05,
           snipe_size_eth_exact TEXT NOT NULL DEFAULT '0.05',
+          max_trade_sol_exact TEXT NOT NULL DEFAULT '0.1',
+          max_trade_eth_exact TEXT NOT NULL DEFAULT '0.05',
+          max_daily_spend_sol_exact TEXT NOT NULL DEFAULT '1',
+          max_daily_spend_eth_exact TEXT NOT NULL DEFAULT '0.5',
+          max_slippage_bps INTEGER NOT NULL DEFAULT 500,
+          cooldown_seconds INTEGER NOT NULL DEFAULT 0,
           copy_target TEXT,
           copy_size_ratio REAL NOT NULL DEFAULT 0.1,
           copy_size_ratio_exact TEXT NOT NULL DEFAULT '0.1',
@@ -208,6 +220,12 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
   ensureColumn("users", "snipe_size_eth_exact", "TEXT NOT NULL DEFAULT '0.05'");
   ensureColumn("users", "copy_size_ratio_exact", "TEXT NOT NULL DEFAULT '0.1'");
   ensureColumn("users", "copy_max_amount_exact", "TEXT NOT NULL DEFAULT '0.2'");
+  ensureColumn("users", "max_trade_sol_exact", "TEXT NOT NULL DEFAULT '0.1'");
+  ensureColumn("users", "max_trade_eth_exact", "TEXT NOT NULL DEFAULT '0.05'");
+  ensureColumn("users", "max_daily_spend_sol_exact", "TEXT NOT NULL DEFAULT '1'");
+  ensureColumn("users", "max_daily_spend_eth_exact", "TEXT NOT NULL DEFAULT '0.5'");
+  ensureColumn("users", "max_slippage_bps", "INTEGER NOT NULL DEFAULT 500");
+  ensureColumn("users", "cooldown_seconds", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn("trade_lifecycle", "job_id", "TEXT");
   const legacyUsers = db.prepare(`SELECT telegram_id, snipe_size_sol, snipe_size_sol_exact, snipe_size_eth, snipe_size_eth_exact,
     copy_size_ratio, copy_size_ratio_exact, copy_max_amount, copy_max_amount_exact FROM users`).all() as Array<{
@@ -281,6 +299,12 @@ export interface UserRow {
   snipe_size_sol_exact: string;
   snipe_size_eth: number;
   snipe_size_eth_exact: string;
+  max_trade_sol_exact: string;
+  max_trade_eth_exact: string;
+  max_daily_spend_sol_exact: string;
+  max_daily_spend_eth_exact: string;
+  max_slippage_bps: number;
+  cooldown_seconds: number;
   copy_target: string | null;
   copy_size_ratio: number;
   copy_size_ratio_exact: string;
@@ -448,13 +472,43 @@ export function setUserStatus(db: Database.Database, telegramId: string, status:
 export function updateUserSettings(
   db: Database.Database,
   telegramId: string,
-  patch: Partial<Pick<UserRow, "snipe_enabled" | "snipe_size_sol" | "snipe_size_sol_exact" | "snipe_size_eth" | "snipe_size_eth_exact" | "copy_target" | "copy_size_ratio" | "copy_size_ratio_exact" | "copy_max_amount" | "copy_max_amount_exact" | "copy_sells">>
+  patch: Partial<Pick<UserRow,
+    | "snipe_enabled" | "snipe_size_sol" | "snipe_size_sol_exact" | "snipe_size_eth" | "snipe_size_eth_exact"
+    | "copy_target" | "copy_size_ratio" | "copy_size_ratio_exact" | "copy_max_amount" | "copy_max_amount_exact" | "copy_sells"
+    | "max_trade_sol_exact" | "max_trade_eth_exact" | "max_daily_spend_sol_exact" | "max_daily_spend_eth_exact"
+    | "max_slippage_bps" | "cooldown_seconds"
+  >>
 ) {
   const fields = Object.keys(patch);
   if (fields.length === 0) return;
   const setClause = fields.map((f) => `${f} = ?`).join(", ");
   const values = fields.map((f) => (patch as any)[f]);
   db.prepare(`UPDATE users SET ${setClause} WHERE telegram_id = ?`).run(...values, telegramId);
+}
+
+export function listDailyBuyExposureAmounts(
+  db: Database.Database,
+  userId: string,
+  chain: "solana" | "evm",
+  dayStart: number,
+  excludeJobId?: string,
+  excludeLifecycleId?: string
+): string[] {
+  const excludedLifecycle = excludeLifecycleId ?? (excludeJobId
+    ? (db.prepare(`SELECT lifecycle_id FROM trade_jobs WHERE id = ?`).get(excludeJobId) as { lifecycle_id: string | null } | undefined)?.lifecycle_id
+    : undefined);
+  const lifecycleRows = db.prepare(`SELECT amount FROM trade_lifecycle
+    WHERE user_id = ? AND chain = ? AND side = 'buy' AND created_at >= ?
+      AND id IS NOT COALESCE(?, '')
+      AND (status IN ('prepared','submitted','confirmed','unknown')
+        OR (status = 'failed' AND transaction_ref IS NOT NULL))`)
+    .all(userId, chain, dayStart, excludedLifecycle ?? null) as { amount: string }[];
+  const jobRows = db.prepare(`SELECT amount FROM trade_jobs
+    WHERE user_id = ? AND chain = ? AND side = 'buy'
+      AND status IN ('queued','processing') AND lifecycle_id IS NULL
+      AND created_at >= ? AND id IS NOT COALESCE(?, '')`)
+    .all(userId, chain, dayStart, excludeJobId ?? null) as { amount: string }[];
+  return [...lifecycleRows, ...jobRows].map((row) => row.amount);
 }
 
 export interface SystemControls {

@@ -1,7 +1,7 @@
 import { Telegraf, Markup } from "telegraf";
 import { randomUUID } from "node:crypto";
 import Database from "better-sqlite3";
-import { isPositiveDecimal, parseUnitsExact } from "../shared/amount.js";
+import { isNonNegativeDecimal, isPositiveDecimal, parseUnitsExact } from "../shared/amount.js";
 import type { AppConfig } from "../config/env.js";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { Contract, formatUnits, getAddress, isAddress, JsonRpcProvider, Provider } from "ethers";
@@ -54,7 +54,7 @@ export interface BotDeps {
   evmProvider: Provider;
   evmHttpProvider: JsonRpcProvider;
   adminBootstrapId: string;
-  tradingLimits: Pick<AppConfig, "maxTradeSol" | "maxTradeEth" | "maxSlippageBps" | "tradeQuoteTtlSeconds">;
+  tradingLimits: Pick<AppConfig, "maxTradeSol" | "maxTradeEth" | "maxDailySpendSol" | "maxDailySpendEth" | "maxSlippageBps" | "tradeQuoteTtlSeconds">;
 }
 
 const HELP_TEXT = `maestro
@@ -68,6 +68,7 @@ function homeKeyboard(isAdmin: boolean) {
     [Markup.button.callback("💼 Wallets", "home_wallets"), Markup.button.callback("📊 Portfolio", "wallets_portfolio")],
     [Markup.button.callback("🔄 Trade", "home_trade")],
     [Markup.button.callback("🎯 Auto-buy", "home_snipe"), Markup.button.callback("🔁 Copy trading", "home_copytrade")],
+    [Markup.button.callback("⚙️ Trading settings", "home_risk_settings")],
     [Markup.button.callback("📈 Orders", "home_orders"), Markup.button.callback("🧾 Recent trades", "home_trades")],
     [Markup.button.callback("❔ Help", "home_help")],
   ];
@@ -174,6 +175,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   };
   type PendingInput =
     | { kind: "snipe_size"; chain: "solana" | "evm" }
+    | { kind: "risk_setting"; field: "max_trade_sol_exact" | "max_trade_eth_exact" | "max_daily_spend_sol_exact" | "max_daily_spend_eth_exact" | "max_slippage_bps" | "cooldown_seconds" }
     | { kind: "manual_trade"; chain: "solana" | "evm"; side: "buy" | "sell"; step: "asset" | "pool" | "amount"; values: ManualTradeDraft }
     | { kind: "copy_target" }
     | { kind: "copy_ratio" }
@@ -468,6 +470,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     if (!decision.allowed) {
       return ctx.reply(`Trade not allowed: ${decision.reasons.join(", ")}. Request a new quote after resolving this.`);
     }
+    if (quote.slippageBps > decision.maxSlippageBps) {
+      return ctx.reply("Your slippage ceiling changed after this quote. Request a fresh quote before trading.");
+    }
 
     let lifecycle: ReturnType<typeof beginTrackedTrade> | undefined;
     try {
@@ -479,6 +484,33 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         asset: quote.asset,
         amount: quote.amount,
       });
+      const assertCurrentBuyPolicy = () => {
+        const latest = evaluateTradePolicy(db, tradingLimits, {
+          userId: quote.userId,
+          chain: quote.chain,
+          side: "buy",
+          amount: quote.amount,
+          source: "manual",
+          excludeLifecycleId: lifecycle!.id,
+        });
+        if (!latest.allowed) throw new Error(`Risk policy changed before submission: ${latest.reasons.join(", ")}.`);
+        if (latest.maxSlippageBps < quote.slippageBps) {
+          throw new Error("Slippage ceiling changed before submission; request a fresh quote.");
+        }
+        assertBuyEntryEnabled(db, quote.userId, quote.chain, "manual");
+      };
+      const assertCurrentSellSlippage = () => {
+        const latest = evaluateTradePolicy(db, tradingLimits, {
+          userId: quote.userId,
+          chain: quote.chain,
+          side: "sell",
+          amount: quote.amount,
+          source: "manual",
+        });
+        if (latest.maxSlippageBps < quote.slippageBps) {
+          throw new Error("Slippage ceiling changed before submission; request a fresh quote.");
+        }
+      };
       let submissionId: string;
       if (quote.chain === "solana") {
         const wallet = getSolanaTradeWallet(quote.userId);
@@ -491,7 +523,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
               amountInLamports: quote.amountBaseUnits,
               slippageBps: quote.slippageBps,
               approvedMinimumOut: quote.minimumAmountOut,
-              assertCanSubmit: () => assertBuyEntryEnabled(db, quote.userId, "solana", "manual"),
+              assertCanSubmit: assertCurrentBuyPolicy,
               onLifecycleEvent: lifecycle.observe,
             })
           : await executeSolanaSell({
@@ -500,6 +532,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
               poolId,
               amountInTokenBaseUnits: quote.amountBaseUnits,
               slippageBps: quote.slippageBps,
+              assertCanSubmit: assertCurrentSellSlippage,
               approvedMinimumOut: quote.minimumAmountOut,
               onLifecycleEvent: lifecycle.observe,
             });
@@ -513,7 +546,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
               amountInEth: quote.amount,
               slippageBps: quote.slippageBps,
               approvedMinimumOut: quote.minimumAmountOut,
-              assertCanSubmit: () => assertBuyEntryEnabled(db, quote.userId, "evm", "manual"),
+              assertCanSubmit: assertCurrentBuyPolicy,
               onLifecycleEvent: lifecycle.observe,
             })
           : await executeEvmSell({
@@ -522,6 +555,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
               tokenAddress: quote.asset,
               amountInTokenBaseUnits: quote.amountBaseUnits,
               slippageBps: quote.slippageBps,
+              assertCanSubmit: assertCurrentSellSlippage,
               approvedMinimumOut: quote.minimumAmountOut,
               confirmedRequiresApproval: quote.requiresApproval,
               onLifecycleEvent: lifecycle.observe,
@@ -570,14 +604,56 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   async function showSnipeSettings(ctx: any) {
     const user = getUser(db, String(ctx.from!.id))!;
     await ctx.reply(
-      `AUTO-BUY · ${user.snipe_enabled ? "ON" : "OFF"}\n\nWhen enabled, new-pair detection can place real mainnet trades from your primary wallet.\n\nTrade sizes: ${user.snipe_size_sol_exact} SOL / ${user.snipe_size_eth_exact} ETH.\nMaximum per buy: ${tradingLimits.maxTradeSol} SOL / ${tradingLimits.maxTradeEth} ETH.`,
+      `AUTO-BUY · ${user.snipe_enabled ? "ON" : "OFF"}\n\nWhen enabled, new-pair detection can place real mainnet trades from your primary wallet.\n\nTrade sizes: ${user.snipe_size_sol_exact} SOL / ${user.snipe_size_eth_exact} ETH.\nYour per-buy limits: ${user.max_trade_sol_exact} SOL / ${user.max_trade_eth_exact} ETH (admin hard caps: ${tradingLimits.maxTradeSol} SOL / ${tradingLimits.maxTradeEth} ETH).`,
       Markup.inlineKeyboard([
         [Markup.button.callback("✅ Enable", "home_snipe_enable"), Markup.button.callback("⏸ Disable", "home_snipe_disable")],
         [Markup.button.callback("Set SOL size", "home_snipe_size_solana"), Markup.button.callback("Set ETH size", "home_snipe_size_evm")],
+        [Markup.button.callback("⚙️ Trading limits", "home_risk_settings"), Markup.button.callback("↩️ Home", "home")],
+      ])
+    );
+  }
+
+  async function showRiskSettings(ctx: any) {
+    const user = getUser(db, String(ctx.from!.id))!;
+    const solBuyCap = parseUnitsExact(user.max_trade_sol_exact, 9) < parseUnitsExact(tradingLimits.maxTradeSol, 9)
+      ? user.max_trade_sol_exact : tradingLimits.maxTradeSol;
+    const ethBuyCap = parseUnitsExact(user.max_trade_eth_exact, 18) < parseUnitsExact(tradingLimits.maxTradeEth, 18)
+      ? user.max_trade_eth_exact : tradingLimits.maxTradeEth;
+    const solDailyCap = parseUnitsExact(user.max_daily_spend_sol_exact, 9) < parseUnitsExact(tradingLimits.maxDailySpendSol, 9)
+      ? user.max_daily_spend_sol_exact : tradingLimits.maxDailySpendSol;
+    const ethDailyCap = parseUnitsExact(user.max_daily_spend_eth_exact, 18) < parseUnitsExact(tradingLimits.maxDailySpendEth, 18)
+      ? user.max_daily_spend_eth_exact : tradingLimits.maxDailySpendEth;
+    await ctx.reply(
+      `TRADING SETTINGS\n\nEffective per-buy cap: ${solBuyCap} SOL / ${ethBuyCap} ETH (admin hard maximum ${tradingLimits.maxTradeSol} SOL / ${tradingLimits.maxTradeEth} ETH).\nEffective daily buy budget (UTC): ${solDailyCap} SOL / ${ethDailyCap} ETH (admin hard maximum ${tradingLimits.maxDailySpendSol} SOL / ${tradingLimits.maxDailySpendEth} ETH).\nSlippage ceiling: ${Math.min(user.max_slippage_bps, tradingLimits.maxSlippageBps)} bps (admin hard maximum ${tradingLimits.maxSlippageBps} bps).\nBuy cooldown: ${user.cooldown_seconds} seconds.\n\nThese limits apply to manual buys, auto-buy, copy-trading, and buy limit orders. Sell orders remain available. Auto-buy sizes and copy-trading options are configured in their own menus.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Set SOL buy cap", "risk_edit_max_trade_sol_exact"), Markup.button.callback("Set ETH buy cap", "risk_edit_max_trade_eth_exact")],
+        [Markup.button.callback("Set SOL daily budget", "risk_edit_max_daily_spend_sol_exact"), Markup.button.callback("Set ETH daily budget", "risk_edit_max_daily_spend_eth_exact")],
+        [Markup.button.callback("Set slippage", "risk_edit_max_slippage_bps"), Markup.button.callback("Set cooldown", "risk_edit_cooldown_seconds")],
+        [Markup.button.callback("🎯 Auto-buy settings", "home_snipe"), Markup.button.callback("🔁 Copy settings", "home_copytrade")],
         [Markup.button.callback("↩️ Home", "home")],
       ])
     );
   }
+
+  bot.action("home_risk_settings", async (ctx) => {
+    await ctx.answerCbQuery();
+    await showRiskSettings(ctx);
+  });
+
+  bot.action(/^risk_edit_(max_trade_sol_exact|max_trade_eth_exact|max_daily_spend_sol_exact|max_daily_spend_eth_exact|max_slippage_bps|cooldown_seconds)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const field = ctx.match[1] as Extract<PendingInput, { kind: "risk_setting" }>["field"];
+    pendingInputs.set(ctx.from!.id, { kind: "risk_setting", field });
+    const prompts: Record<typeof field, string> = {
+      max_trade_sol_exact: `Send your maximum SOL per buy (greater than 0; admin maximum ${tradingLimits.maxTradeSol}).`,
+      max_trade_eth_exact: `Send your maximum ETH per buy (greater than 0; admin maximum ${tradingLimits.maxTradeEth}).`,
+      max_daily_spend_sol_exact: `Send your SOL daily buy budget in UTC (0 to the admin maximum ${tradingLimits.maxDailySpendSol}; 0 disables buys).`,
+      max_daily_spend_eth_exact: `Send your ETH daily buy budget in UTC (0 to the admin maximum ${tradingLimits.maxDailySpendEth}; 0 disables buys).`,
+      max_slippage_bps: `Send your maximum slippage in basis points (1–${tradingLimits.maxSlippageBps}).`,
+      cooldown_seconds: "Send your buy cooldown in whole seconds (0–3600).",
+    };
+    await ctx.reply(prompts[field], cancelPromptKeyboard);
+  });
 
   bot.action("home_snipe", async (ctx) => {
     await ctx.answerCbQuery();
@@ -1018,9 +1094,62 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         await ctx.reply(prompt, cancelPromptKeyboard);
       };
 
+      if (pendingInput.kind === "risk_setting") {
+        const { field } = pendingInput;
+        let autoBuySizeReduced = false;
+        if (field === "max_trade_sol_exact" || field === "max_trade_eth_exact" ||
+            field === "max_daily_spend_sol_exact" || field === "max_daily_spend_eth_exact") {
+          const isSol = field.endsWith("_sol_exact");
+          const decimals = isSol ? 9 : 18;
+          const hardMaximum = field.startsWith("max_trade_")
+            ? isSol ? tradingLimits.maxTradeSol : tradingLimits.maxTradeEth
+            : isSol ? tradingLimits.maxDailySpendSol : tradingLimits.maxDailySpendEth;
+          const isDailyBudget = field.startsWith("max_daily_spend_");
+          const validAmount = isDailyBudget
+            ? isNonNegativeDecimal(input, decimals)
+            : isPositiveDecimal(input, decimals);
+          if (!validAmount) {
+            return keepPrompt(`Enter a ${isDailyBudget ? "non-negative" : "positive"} amount with at most ${decimals} fractional digits.`);
+          }
+          if (parseUnitsExact(input, decimals) > parseUnitsExact(hardMaximum, decimals)) {
+            return keepPrompt(`The admin-configured maximum is ${hardMaximum} ${isSol ? "SOL" : "ETH"}.`);
+          }
+          updateUserSettings(db, String(ctx.from!.id), { [field]: input });
+          if (field === "max_trade_sol_exact" || field === "max_trade_eth_exact") {
+            const user = getUser(db, String(ctx.from!.id))!;
+            const isSolCap = field === "max_trade_sol_exact";
+            const size = isSolCap ? user.snipe_size_sol_exact : user.snipe_size_eth_exact;
+            if (parseUnitsExact(size, decimals) > parseUnitsExact(input, decimals)) {
+              autoBuySizeReduced = true;
+              updateUserSettings(db, String(ctx.from!.id), isSolCap
+                ? { snipe_size_sol: Number(input), snipe_size_sol_exact: input }
+                : { snipe_size_eth: Number(input), snipe_size_eth_exact: input });
+            }
+          }
+        } else if (field === "max_slippage_bps") {
+          if (!/^\d+$/.test(input) || Number(input) < 1 || Number(input) > tradingLimits.maxSlippageBps) {
+            return keepPrompt(`Enter a whole number from 1 to ${tradingLimits.maxSlippageBps} basis points.`);
+          }
+          updateUserSettings(db, String(ctx.from!.id), { max_slippage_bps: Number(input) });
+        } else {
+          if (!/^\d+$/.test(input) || Number(input) > 3600) {
+            return keepPrompt("Enter a whole number from 0 to 3600 seconds.");
+          }
+          updateUserSettings(db, String(ctx.from!.id), { cooldown_seconds: Number(input) });
+        }
+        await ctx.reply(
+          `Trading setting updated.${autoBuySizeReduced ? " Auto-buy size was lowered to match the new per-buy cap." : ""}`,
+          Markup.inlineKeyboard([[Markup.button.callback("Trading settings", "home_risk_settings")], [Markup.button.callback("Home", "home")]])
+        );
+        return;
+      }
+
       if (pendingInput.kind === "snipe_size") {
         const decimals = pendingInput.chain === "solana" ? 9 : 18;
-        const cap = pendingInput.chain === "solana" ? tradingLimits.maxTradeSol : tradingLimits.maxTradeEth;
+        const user = getUser(db, String(ctx.from!.id))!;
+        const userCap = pendingInput.chain === "solana" ? user.max_trade_sol_exact : user.max_trade_eth_exact;
+        const hardCap = pendingInput.chain === "solana" ? tradingLimits.maxTradeSol : tradingLimits.maxTradeEth;
+        const cap = parseUnitsExact(userCap, decimals) < parseUnitsExact(hardCap, decimals) ? userCap : hardCap;
         if (!isPositiveDecimal(input, decimals)) {
           return keepPrompt(`Enter a positive amount with at most ${decimals} fractional digits.`);
         }

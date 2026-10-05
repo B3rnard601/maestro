@@ -23,8 +23,10 @@ Fill in `.env`:
 - `TELEGRAM_OWNER_ID` — your numeric Telegram id, promotes you to admin on first contact (see the comment in `.env.example` for what this does and doesn't gate)
 - `SOLANA_RPC_HTTP` / `SOLANA_RPC_WSS` — your Helius/Triton endpoints
 - `EVM_RPC_HTTP` / `EVM_RPC_WSS` — your Alchemy/Infura endpoints
-- `MAX_TRADE_SOL` / `MAX_TRADE_ETH` — hard maximum spend for each buy, defaulting to `0.1` SOL / `0.05` ETH. These caps are applied to auto-buy, copy-trading, and limit buys. They are live-mainnet controls, not investment recommendations.
-- `MAX_SLIPPAGE_BPS` — slippage used for swaps, from 1 to 500 basis points (default `500`).
+- `MAX_TRADE_SOL` / `MAX_TRADE_ETH` — admin hard maximum spend for each buy, defaulting to `0.1` SOL / `0.05` ETH.
+- `MAX_DAILY_SPEND_SOL` / `MAX_DAILY_SPEND_ETH` — admin hard maximum buy spend per user and UTC day, defaulting to `1` SOL / `0.5` ETH. Personal limits are configurable in Telegram but cannot exceed these values.
+- `MAX_SLIPPAGE_BPS` — admin hard maximum slippage from 1 to 500 basis points (default `500`); users can set a lower ceiling.
+- In Telegram, **Trading settings** lets each user lower their per-buy cap and daily budget (a zero daily budget disables buys) and set their slippage ceiling and buy cooldown (0–3600 seconds). These apply to manual buys and automated entries, including queued trades; sells are not blocked by these buy limits. Cooldown-delayed jobs remain queued, while jobs that exceed the daily budget fail rather than being carried into the next day. Auto-buy size and copy-trading sizing/target/sell behavior remain in their respective menus.
 - `TRADE_QUOTE_TTL_SECONDS` — expiry for button-driven manual trade previews (10–300 seconds, default `60`). Confirmation is one-use and rechecks the minimum output before signing.
 - Trade lifecycle records are stored in the bot SQLite database. EVM receipts and Solana finalized signatures are reconciled in the background; trades without a final status after 15 minutes are marked `unknown` and continue to be checked. Use **Recent trades** in Telegram to inspect tracked executions.
 - Automated trades and triggered limit orders are persisted in a SQLite queue and processed serially. Retryable failures use bounded exponential backoff (up to five attempts); once a transaction submission may have happened, the worker does not resubmit it and leaves the lifecycle reconciler to determine the result. Buy jobs wait while the admin kill switch is active.

@@ -36,6 +36,7 @@ export interface BuyParams extends BaseParams {
 
 export interface SellParams extends BaseParams {
   amountInTokenBaseUnits: bigint; // token sold, raw base units (caller applies decimals)
+  assertCanSubmit?: () => void;
   approvedMinimumOut?: bigint;
   onLifecycleEvent?: TradeLifecycleObserver;
 }
@@ -235,7 +236,7 @@ export async function executeBuy(params: BuyParams): Promise<string> {
  * passes the token amount being sold — no need to know pool ordering.
  */
 export async function executeSell(params: SellParams): Promise<string> {
-  const { connection, wallet, poolId, amountInTokenBaseUnits, slippageBps, useJitoBundle = true, jitoTipLamports = 100_000, approvedMinimumOut, onLifecycleEvent } = params;
+  const { connection, wallet, poolId, amountInTokenBaseUnits, slippageBps, useJitoBundle = true, jitoTipLamports = 100_000, assertCanSubmit, approvedMinimumOut, onLifecycleEvent } = params;
   const raydium = await getRaydium(connection, wallet);
   const { poolInfo } = await raydium.liquidity.getPoolInfoFromRpc({ poolId });
   const tokenMint = poolInfo.mintA.address === WSOL_MINT ? poolInfo.mintB.address : poolInfo.mintA.address;
@@ -249,5 +250,5 @@ export async function executeSell(params: SellParams): Promise<string> {
     slippageBps,
     approvedMinimumOut
   );
-  return signAndSend(connection, wallet, swapTxs, useJitoBundle, jitoTipLamports, undefined, onLifecycleEvent);
+  return signAndSend(connection, wallet, swapTxs, useJitoBundle, jitoTipLamports, assertCanSubmit, onLifecycleEvent);
 }
