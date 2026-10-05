@@ -42,7 +42,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 npm run dev
 ```
 
-Message your bot on Telegram — you're auto-registered on first contact. If your id matches `TELEGRAM_OWNER_ID` you're promoted to admin and auto-approved; otherwise you land in `pending` and need to approve yourself via the other account, or just make sure `TELEGRAM_OWNER_ID` is your own id before testing. Once active, use `/wallets` → Import Wallet, fund the imported address, then `/snipe_on` or create limit orders. Every other Telegram user who messages the bot goes through the same pending → approved flow before any of that responds for them — see the operational checklist below.
+Message your bot on Telegram — you're auto-registered on first contact. If your id matches `TELEGRAM_OWNER_ID` you're promoted to admin and auto-approved. Other users remain pending and can only import a wallet and view onboarding/help until an admin approves them. An admin can approve only after at least one wallet has been imported. Every trading and account feature stays unavailable until both steps are complete; see the operational checklist below.
 
 ## Admin app
 
@@ -135,7 +135,7 @@ Latency to your RPC and to the Jito block engine/Flashbots relay is the entire g
 
 ## Operational checklist before going live
 
-1. **Set `TELEGRAM_OWNER_ID` — this is no longer optional.** Every new user now starts in a `pending` state and can't touch any trading feature until an admin approves them (`/admin_approve <telegram_id>`, or the one-tap "✅ Approve" button you get DMed for each new signup). Without `TELEGRAM_OWNER_ID` set, there's no admin at all, so no one — including you — can ever be approved.
+1. **Set `TELEGRAM_OWNER_ID` — this is no longer optional.** Every new non-admin user starts in a `pending` state. They must import a wallet and then be approved by an admin (`/admin_approve <telegram_id>`, or the one-tap "✅ Approve" button sent to the admin after wallet import) before using other commands or features. Without `TELEGRAM_OWNER_ID` set, there's no admin, so no one — including you — can ever be approved.
 2. **Set `ADMIN_PASSWORD` and `ADMIN_JWT_SECRET`** for the admin server — long random values, not something guessable. The admin dashboard can ban users and cancel anyone's orders.
 3. Auto-buy defaults to off per user (`snipe_enabled = 0`) — each user opts in with `/snipe_on` deliberately, not on registration.
 4. Watch console logs for a while first (`[SOL] safety check for ... safe=...`) to see real pass/fail rates before anyone risks funds.

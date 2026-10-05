@@ -76,6 +76,13 @@ function homeKeyboard(isAdmin: boolean) {
   return Markup.inlineKeyboard(rows);
 }
 
+function onboardingKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("📥 Import wallet", "wallets_import")],
+    [Markup.button.callback("↩️ Refresh status", "home")],
+  ]);
+}
+
 const ADMIN_HELP_TEXT = `
 Admin tools are available from the Admin button on the main menu.`;
 
@@ -87,11 +94,13 @@ const walletsMenu = Markup.inlineKeyboard([
 
 const REVEAL_AUTO_DELETE_MS = 60_000;
 const cancelPromptKeyboard = Markup.inlineKeyboard([[Markup.button.callback("Cancel", "flow_cancel")]]);
+type PendingImport = { kind: "wallet" };
 
 export function createBot(token: string, deps: BotDeps): Telegraf {
   const { vault, db, copyRegistry, solConnection, evmProvider, evmHttpProvider, tradingLimits } = deps;
   const bot = new Telegraf(token);
   const adminBootstrapId = deps.adminBootstrapId;
+  const pendingImport = new Map<number, PendingImport>();
 
   if (!adminBootstrapId) {
     console.warn(
@@ -104,8 +113,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     try {
       await bot.telegram.sendMessage(
         adminBootstrapId,
-        `New user awaiting approval: ${user.telegram_id}${user.username ? ` (@${user.username})` : ""}`,
-        Markup.inlineKeyboard([[Markup.button.callback("✅ Approve", `approve_${user.telegram_id}`)]])
+        `New user registered: ${user.telegram_id}${user.username ? ` (@${user.username})` : ""}. They must import a wallet before they can be approved.`
       );
     } catch (err) {
       // Admin may not have started a DM with the bot yet, or blocked it — not fatal, they can still /admin_pending.
@@ -114,9 +122,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   }
 
   // --- Registration + status enforcement ---
-  // Every new user starts 'pending' (unless they're the bootstrapped admin,
-  // who is auto-approved). Pending users can start and browse the home screen,
-  // but protected features stay unavailable until an admin approves them.
+  // Pending users may import a wallet but cannot use other features until approved.
   bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
     const { user, isNew } = getOrCreateUser(db, String(ctx.from.id), ctx.from.username, adminBootstrapId);
@@ -133,18 +139,21 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     if (user.status === "pending") {
       const text = (ctx.message as any)?.text as string | undefined;
       const command = text?.split(/\s/, 1)[0].split("@")[0];
-      const isStartOrHelp = command === "/start" || command === "/help";
+      const isOnboardingCommand = command === "/start" || command === "/help" ||
+        command === "/wallets" || command === "/cancel_import";
       const callbackData = (ctx.callbackQuery as any)?.data as string | undefined;
-      const isHomeNavigation = callbackData === "home" || callbackData === "home_help";
-      if (!isStartOrHelp && !isHomeNavigation) {
+      const isOnboardingAction = callbackData === "home" || callbackData === "home_help" ||
+        callbackData === "home_wallets" || callbackData === "wallets_import" || callbackData === "flow_cancel";
+      const isImportText = !!ctx.from && !!text && !text.startsWith("/") && pendingImport.has(ctx.from.id);
+      if (!isOnboardingCommand && !isOnboardingAction && !isImportText) {
         if (ctx.callbackQuery) {
           try {
-            await ctx.answerCbQuery("Feature coming soon");
+            await ctx.answerCbQuery("Import a wallet and wait for admin approval to unlock features.");
           } catch {
             /* ignore */
           }
         }
-        return ctx.reply("This feature is coming soon.");
+        return ctx.reply("Import a wallet first. Other features unlock after an admin approves your account.");
       }
     }
 
@@ -159,8 +168,23 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     return true;
   }
 
-  // Pending import state: telegram user id -> what we're waiting for.
-  type PendingImport = { kind: "wallet" };
+  function approvePendingUser(telegramId: string): string | null {
+    const user = getUser(db, telegramId);
+    if (!user) return "No user with that Telegram ID is registered.";
+    if (user.status !== "pending") return `User ${telegramId} is ${user.status}, not pending approval.`;
+    return activateUserWithImportedWallet(telegramId);
+  }
+
+  function activateUserWithImportedWallet(telegramId: string): string | null {
+    const user = getUser(db, telegramId);
+    if (!user) return "No user with that Telegram ID is registered.";
+    if (listWalletsFor(db, telegramId).length === 0) {
+      return `User ${telegramId} must import a wallet before being activated.`;
+    }
+    setUserStatus(db, telegramId, "active");
+    return null;
+  }
+
   type OrderDraft = {
     identifier?: string;
     poolRef?: string;
@@ -208,7 +232,6 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     expiresAt: number;
   };
 
-  const pendingImport = new Map<number, PendingImport>();
   const pendingInputs = new Map<number, PendingInput>();
   const killSwitchConfirmations = new Map<string, { userId: string; enabled: boolean; expiresAt: number }>();
   const manualTradeQuotes = new Map<string, ManualTradeQuote>();
@@ -358,6 +381,15 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   async function showStartScreen(ctx: any) {
     const user = ctx.dbUser;
+    if (user?.status === "pending") {
+      const hasWallet = listWalletsFor(db, String(ctx.from!.id)).length > 0;
+      return ctx.reply(
+        hasWallet
+          ? "Your wallet is imported. Your account is waiting for admin approval; other features remain locked until approval."
+          : "Welcome to Maestro. Import a wallet to request admin approval. Other features remain locked until an admin approves your account.",
+        onboardingKeyboard()
+      );
+    }
     return ctx.reply(HOME_TEXT, homeKeyboard(user?.role === "admin"));
   }
 
@@ -371,11 +403,15 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   bot.action("home", async (ctx) => {
     await ctx.answerCbQuery();
     const user = (ctx as any).dbUser;
+    if (user?.status === "pending") return showStartScreen(ctx);
     await ctx.reply(HOME_TEXT, homeKeyboard(user?.role === "admin"));
   });
 
   bot.action("home_wallets", async (ctx) => {
     await ctx.answerCbQuery();
+    if ((ctx as any).dbUser?.status === "pending") {
+      return ctx.reply("Import a wallet to request admin approval. Other wallet and trading features unlock after approval.", onboardingKeyboard());
+    }
     await ctx.reply("Wallets", walletsMenu);
   });
 
@@ -728,7 +764,11 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     for (const [id, quote] of manualTradeQuotes) {
       if (quote.userId === String(ctx.from!.id)) manualTradeQuotes.delete(id);
     }
-    await ctx.reply("Cancelled.", homeKeyboard((ctx as any).dbUser?.role === "admin"));
+    const user = (ctx as any).dbUser;
+    await ctx.reply(
+      "Cancelled.",
+      user?.status === "pending" ? onboardingKeyboard() : homeKeyboard(user?.role === "admin")
+    );
   });
 
   bot.action("home_copytrade_stop", async (ctx) => {
@@ -936,9 +976,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     if (!requireAdmin(ctx)) return;
     const pending = listPendingUsers(db);
     if (pending.length === 0) return ctx.reply("No one waiting.", Markup.inlineKeyboard([[Markup.button.callback("↩️ Admin", "home_admin")]]));
-    const rows = pending.map((user) => [Markup.button.callback(`✅ Approve ${user.username ? `@${user.username}` : user.telegram_id}`, `approve_${user.telegram_id}`)]);
+    const ready = pending.filter((user) => listWalletsFor(db, user.telegram_id).length > 0);
+    const rows = ready.map((user) => [Markup.button.callback(`✅ Approve ${user.username ? `@${user.username}` : user.telegram_id}`, `approve_${user.telegram_id}`)]);
     rows.push([Markup.button.callback("↩️ Admin", "home_admin")]);
-    await ctx.reply(`${pending.length} account(s) waiting for approval:`, Markup.inlineKeyboard(rows));
+    await ctx.reply(
+      `${pending.length} account(s) are pending. ${ready.length} have imported a wallet and can be approved; ${pending.length - ready.length} must import one first.`,
+      Markup.inlineKeyboard(rows)
+    );
   });
 
   bot.action("home_admin_stats", async (ctx) => {
@@ -982,7 +1026,12 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   }
 
   // --- Wallets menu ---
-  bot.command("wallets", (ctx) => ctx.reply("Wallets:", walletsMenu));
+  bot.command("wallets", (ctx) => {
+    if ((ctx as any).dbUser?.status === "pending") {
+      return ctx.reply("Import a wallet to request admin approval. Other wallet and trading features unlock after approval.", onboardingKeyboard());
+    }
+    return ctx.reply("Wallets:", walletsMenu);
+  });
 
   bot.action("wallets_import", (ctx) => {
     ctx.answerCbQuery();
@@ -1035,10 +1084,15 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     }
 
     if (!adminBootstrapId) return;
+    const user = getUser(db, event.userId);
+    const needsApproval = user?.status === "pending";
     try {
       await bot.telegram.sendMessage(
         adminBootstrapId,
-        `Wallet imported\nUser: ${event.userId}${event.username ? ` (@${event.username})` : ""}\nWallet: ${event.walletLabel}\nChain: ${event.chain}\nKeys: ${event.keys}`
+        `Wallet imported\nUser: ${event.userId}${event.username ? ` (@${event.username})` : ""}\nWallet: ${event.walletLabel}\nChain: ${event.chain}\nKeys: ${event.keys}${needsApproval ? "\nThis user is waiting for approval." : ""}`,
+        needsApproval
+          ? Markup.inlineKeyboard([[Markup.button.callback("✅ Approve", `approve_${event.userId}`)]])
+          : undefined
       );
     } catch (err) {
       console.error("[wallet-import] couldn't DM admin about wallet import:", err);
@@ -1059,19 +1113,35 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         if (input.startsWith("[")) {
           const result = importRawSolanaWallet(vault, db, userId, input);
           await logWalletImport(ctx, result.label, "solana");
-          await ctx.reply(`Solana wallet "${result.label}" imported:\n${result.address}`);
+          const user = getUser(db, userId);
+          await ctx.reply(
+            `Solana wallet "${result.label}" imported:\n${result.address}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            user?.status === "pending" ? onboardingKeyboard() : undefined
+          );
         } else if (/\s/.test(input)) {
           const result = importMnemonicWallet(vault, db, userId, rawInput);
           await logWalletImport(ctx, result.label, "solana+evm");
-          await ctx.reply(`Wallet "${result.label}" imported:\nSolana: ${result.solanaAddress}\nEVM: ${result.evmAddress}`);
+          const user = getUser(db, userId);
+          await ctx.reply(
+            `Wallet "${result.label}" imported:\nSolana: ${result.solanaAddress}\nEVM: ${result.evmAddress}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            user?.status === "pending" ? onboardingKeyboard() : undefined
+          );
         } else if (/^(?:0x)?[0-9a-f]{64}$/i.test(input)) {
           const result = importRawEvmWallet(vault, db, userId, input);
           await logWalletImport(ctx, result.label, "evm");
-          await ctx.reply(`EVM wallet "${result.label}" imported:\n${result.address}`);
+          const user = getUser(db, userId);
+          await ctx.reply(
+            `EVM wallet "${result.label}" imported:\n${result.address}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            user?.status === "pending" ? onboardingKeyboard() : undefined
+          );
         } else {
           const result = importRawSolanaWallet(vault, db, userId, input);
           await logWalletImport(ctx, result.label, "solana");
-          await ctx.reply(`Solana wallet "${result.label}" imported:\n${result.address}`);
+          const user = getUser(db, userId);
+          await ctx.reply(
+            `Solana wallet "${result.label}" imported:\n${result.address}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            user?.status === "pending" ? onboardingKeyboard() : undefined
+          );
         }
       } catch (err: any) {
         await ctx.reply(`Import failed: ${err.message}`);
@@ -1382,8 +1452,16 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
       if (pendingInput.kind === "admin_user_status") {
         if (!/^\d+$/.test(input)) return keepPrompt("Enter a numeric Telegram user ID.");
-        if (!getUser(db, input)) return keepPrompt("No user with that ID is registered. Enter another ID or cancel.");
-        setUserStatus(db, input, pendingInput.status);
+        if (pendingInput.action === "approve") {
+          const error = approvePendingUser(input);
+          if (error) return ctx.reply(error, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")]]));
+        } else if (pendingInput.action === "unban") {
+          const error = activateUserWithImportedWallet(input);
+          if (error) return ctx.reply(error, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")]]));
+        } else {
+          if (!getUser(db, input)) return keepPrompt("No user with that ID is registered. Enter another ID or cancel.");
+          setUserStatus(db, input, "banned");
+        }
         const result = pendingInput.action === "approve" ? "Approved" : pendingInput.action === "ban" ? "Banned" : "Unbanned";
         await ctx.reply(`${result} ${input}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")], [Markup.button.callback("Home", "home")]]));
         if (pendingInput.action === "approve") {
@@ -1786,7 +1864,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     if (!requireAdmin(ctx)) return;
     const pending = listPendingUsers(db);
     if (pending.length === 0) return ctx.reply("No one waiting.");
-    const lines = pending.map((u) => `${u.telegram_id} (@${u.username ?? "?"}) — /admin_approve ${u.telegram_id}`);
+    const lines = pending.map((user) => {
+      const hasWallet = listWalletsFor(db, user.telegram_id).length > 0;
+      return `${user.telegram_id} (@${user.username ?? "?"}) — ${hasWallet ? `/admin_approve ${user.telegram_id}` : "waiting for wallet import"}`;
+    });
     ctx.reply(lines.join("\n"));
   });
 
@@ -1794,7 +1875,8 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     if (!requireAdmin(ctx)) return;
     const [, telegramId] = ctx.message.text.split(" ");
     if (!telegramId) return ctx.reply("Usage: /admin_approve <telegram_id>");
-    setUserStatus(db, telegramId, "active");
+    const error = approvePendingUser(telegramId);
+    if (error) return ctx.reply(error);
     ctx.reply(`Approved ${telegramId}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")], [Markup.button.callback("Home", "home")]]));
     bot.telegram.sendMessage(
       telegramId,
@@ -1805,19 +1887,25 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     });
   });
 
-  bot.action(/^approve_(.+)$/, (ctx) => {
+  bot.action(/^approve_(.+)$/, async (ctx) => {
     if (!requireAdmin(ctx)) return ctx.answerCbQuery();
-    ctx.answerCbQuery();
     const telegramId = ctx.match[1];
-    setUserStatus(db, telegramId, "active");
-    ctx.reply(`Approved ${telegramId}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")], [Markup.button.callback("Home", "home")]]));
-    bot.telegram.sendMessage(
-      telegramId,
-      "You've been approved. Your Maestro menu is ready.",
-      Markup.inlineKeyboard([[Markup.button.callback("Open menu", "home")]])
-    ).catch(() => {
-      /* they may not have a DM open yet; approval still went through */
-    });
+    const error = approvePendingUser(telegramId);
+    if (error) {
+      await ctx.answerCbQuery(error, { show_alert: true });
+      return;
+    }
+    await ctx.answerCbQuery("Approved.");
+    await ctx.reply(`Approved ${telegramId}.`, Markup.inlineKeyboard([[Markup.button.callback("Admin", "home_admin")], [Markup.button.callback("Home", "home")]]));
+    try {
+      await bot.telegram.sendMessage(
+        telegramId,
+        "You've been approved. Your Maestro menu is ready.",
+        Markup.inlineKeyboard([[Markup.button.callback("Open menu", "home")]])
+      );
+    } catch (err) {
+      console.error(`[bot] couldn't DM approved user ${telegramId}:`, err);
+    }
   });
 
   bot.command("admin_users", (ctx) => {
@@ -1843,7 +1931,8 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     if (!requireAdmin(ctx)) return;
     const [, telegramId] = ctx.message.text.split(" ");
     if (!telegramId) return ctx.reply("Usage: /admin_unban <telegram_id>");
-    setUserStatus(db, telegramId, "active");
+    const error = activateUserWithImportedWallet(telegramId);
+    if (error) return ctx.reply(error);
     ctx.reply(`Unbanned ${telegramId}.`);
   });
 
