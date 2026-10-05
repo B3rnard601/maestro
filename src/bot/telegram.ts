@@ -30,6 +30,12 @@ import { CopyTradeRegistry } from "../copytrade/registry.js";
 import { createOrder, cancelOrder } from "../orders/limitOrderEngine.js";
 import { getSolanaPortfolio, getEvmPortfolio } from "../portfolio/portfolio.js";
 import {
+  formatFundingAmount,
+  initializeEvmFunding,
+  initializeSolanaFunding,
+  updateWalletFunding,
+} from "../portfolio/funding.js";
+import {
   getHoldings,
   getSystemControls,
   getOrCreateUser,
@@ -1730,6 +1736,56 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     }
   }
 
+  async function initializeImportedWalletFunding(
+    userId: string,
+    label: string,
+    chain: "solana" | "evm" | "solana+evm",
+  ): Promise<string> {
+    const failedChains: string[] = [];
+    const chains = chain === "solana+evm"
+      ? ["solana", "evm"] as const
+      : [chain] as const;
+    for (const walletChain of chains) {
+      const wallet = getWallet(db, userId, walletChain, label);
+      if (!wallet) {
+        failedChains.push(walletChain);
+        continue;
+      }
+      try {
+        if (walletChain === "solana") {
+          await initializeSolanaFunding(db, wallet, solConnection);
+        } else {
+          await initializeEvmFunding(
+            db,
+            wallet,
+            evmHttpProvider,
+            getHoldings(db, "evm", userId),
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[funding] couldn't initialize ${walletChain} tracking for ${label}:`,
+          err,
+        );
+        failedChains.push(walletChain);
+      }
+    }
+    return failedChains.length
+      ? `\n\n⚠️ Funding totals couldn't be initialized for ${failedChains.join(" and ")}.`
+      : "";
+  }
+
+  function fundingSummaryLines(
+    assets: Awaited<ReturnType<typeof updateWalletFunding>>,
+  ): string[] {
+    return assets.map((asset) => {
+      const initialUnits = BigInt(asset.initialUnits);
+      const receivedUnits = BigInt(asset.receivedUnits);
+      const totalUnits = initialUnits + receivedUnits;
+      return `📥 Funded ${asset.symbol}: ${formatFundingAmount(initialUnits.toString(), asset.decimals)} + ${formatFundingAmount(receivedUnits.toString(), asset.decimals)} received = ${formatFundingAmount(totalUnits.toString(), asset.decimals)}`;
+    });
+  }
+
   // Catches the seed-phrase/private-key text message that follows an import action.
   // Must skip slash commands so it doesn't swallow them.
   bot.on("text", async (ctx, next) => {
@@ -1743,34 +1799,54 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         const input = rawInput.trim();
         if (input.startsWith("[")) {
           const result = importRawSolanaWallet(vault, db, userId, input);
+          const fundingWarning = await initializeImportedWalletFunding(
+            userId,
+            result.label,
+            "solana",
+          );
           await logWalletImport(ctx, result.label, "solana");
           const user = getUser(db, userId);
           await ctx.reply(
-            `Solana wallet "${result.label}" imported:\n${result.address}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            `Solana wallet "${result.label}" imported:\n${result.address}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
             user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         } else if (/\s/.test(input)) {
           const result = importMnemonicWallet(vault, db, userId, rawInput);
+          const fundingWarning = await initializeImportedWalletFunding(
+            userId,
+            result.label,
+            "solana+evm",
+          );
           await logWalletImport(ctx, result.label, "solana+evm");
           const user = getUser(db, userId);
           await ctx.reply(
-            `Wallet "${result.label}" imported:\nSolana: ${result.solanaAddress}\nEVM: ${result.evmAddress}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            `Wallet "${result.label}" imported:\nSolana: ${result.solanaAddress}\nEVM: ${result.evmAddress}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
             user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         } else if (/^(?:0x)?[0-9a-f]{64}$/i.test(input)) {
           const result = importRawEvmWallet(vault, db, userId, input);
+          const fundingWarning = await initializeImportedWalletFunding(
+            userId,
+            result.label,
+            "evm",
+          );
           await logWalletImport(ctx, result.label, "evm");
           const user = getUser(db, userId);
           await ctx.reply(
-            `EVM wallet "${result.label}" imported:\n${result.address}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            `EVM wallet "${result.label}" imported:\n${result.address}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
             user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         } else {
           const result = importRawSolanaWallet(vault, db, userId, input);
+          const fundingWarning = await initializeImportedWalletFunding(
+            userId,
+            result.label,
+            "solana",
+          );
           await logWalletImport(ctx, result.label, "solana");
           const user = getUser(db, userId);
           await ctx.reply(
-            `Solana wallet "${result.label}" imported:\n${result.address}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            `Solana wallet "${result.label}" imported:\n${result.address}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
             user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         }
@@ -2446,6 +2522,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const lines = [`${chain === "solana" ? "SOLANA" : "EVM"} wallets:`, ""];
     for (const w of wallets) {
       let balanceLine = "";
+      let fundingLines: string[] = [];
       try {
         if (chain === "solana") {
           const p = await getSolanaPortfolio(
@@ -2460,11 +2537,23 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       } catch {
         balanceLine = "💰 (couldn't fetch)";
       }
+      try {
+        fundingLines = fundingSummaryLines(
+          await updateWalletFunding(db, w, solConnection, evmHttpProvider),
+        );
+      } catch (err) {
+        console.error(`[funding] couldn't update ${chain} totals for ${w.label}:`, err);
+        fundingLines = ["📥 Funding totals unavailable"];
+      }
       lines.push(
         `${w.label}: ${w.address}`,
         `${w.is_primary ? "⭐ Primary" : ""} ${balanceLine}`.trim(),
+        ...fundingLines,
         "",
       );
+    }
+    if (chain === "evm") {
+      lines.push("EVM token totals cover tokens known to the bot at import.");
     }
     lines.push(
       "Tap a wallet's name to view/reveal it. ⭐ sets which wallet auto-buy, copy-trade, and limit orders use.",
@@ -2652,6 +2741,16 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           p.tokens.forEach((t) =>
             lines.push(`🪙 ${t.uiAmount} · ${t.mint.slice(0, 8)}...`),
           );
+          try {
+            lines.push(
+              ...fundingSummaryLines(
+                await updateWalletFunding(db, w, solConnection, evmHttpProvider),
+              ),
+            );
+          } catch (err) {
+            console.error(`[funding] couldn't update Solana totals for ${w.label}:`, err);
+            lines.push("📥 Funding totals unavailable");
+          }
         } catch (err: any) {
           lines.push(
             `\n🔹 ${w.label} · SOLANA`,
@@ -2673,6 +2772,16 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           p.tokens.forEach((t) =>
             lines.push(`🪙 ${Number(t.balance).toFixed(4)} ${t.symbol}`),
           );
+          try {
+            lines.push(
+              ...fundingSummaryLines(
+                await updateWalletFunding(db, w, solConnection, evmHttpProvider),
+              ),
+            );
+          } catch (err) {
+            console.error(`[funding] couldn't update EVM totals for ${w.label}:`, err);
+            lines.push("📥 Funding totals unavailable");
+          }
         } catch (err: any) {
           lines.push(
             `\n🔹 ${w.label} · EVM`,
@@ -2680,6 +2789,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           );
         }
       }
+    }
+    if (wallets.some((wallet) => wallet.chain === "evm")) {
+      lines.push("\nEVM token funding totals include tokens known to the bot at import.");
     }
 
     ctx.reply(

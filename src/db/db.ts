@@ -87,6 +87,37 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       created_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS wallet_funding_state (
+      wallet_id TEXT PRIMARY KEY,
+      chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
+      imported_at INTEGER NOT NULL,
+      baseline_slot INTEGER NOT NULL DEFAULT 0,
+      cursor TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS wallet_funding_assets (
+      wallet_id TEXT NOT NULL,
+      asset_id TEXT NOT NULL,
+      symbol TEXT NOT NULL,
+      decimals INTEGER NOT NULL,
+      initial_units TEXT NOT NULL,
+      baseline_slot INTEGER NOT NULL DEFAULT 0,
+      received_units TEXT NOT NULL DEFAULT '0',
+      PRIMARY KEY(wallet_id, asset_id)
+    );
+    CREATE TABLE IF NOT EXISTS wallet_funding_events (
+      wallet_id TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      asset_id TEXT NOT NULL,
+      amount_units TEXT NOT NULL,
+      PRIMARY KEY(wallet_id, event_id, asset_id)
+    );
+    CREATE TABLE IF NOT EXISTS wallet_funding_cursors (
+      wallet_id TEXT NOT NULL,
+      address TEXT NOT NULL,
+      cursor TEXT,
+      PRIMARY KEY(wallet_id, address)
+    );
+
     CREATE TABLE IF NOT EXISTS system_controls (
       id INTEGER PRIMARY KEY CHECK(id = 1),
       kill_switch_enabled INTEGER NOT NULL DEFAULT 0 CHECK(kill_switch_enabled IN (0,1)),
@@ -157,6 +188,15 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
   db.prepare(`INSERT OR IGNORE INTO system_controls (id, kill_switch_enabled, updated_at, updated_by) VALUES (1, 0, ?, NULL)`)
     .run(Date.now());
   db.exec(`UPDATE wallet_import_events SET keys = '[redacted]' WHERE keys <> '[redacted]'`);
+
+  const fundingStateColumns = db.prepare(`PRAGMA table_info(wallet_funding_state)`).all() as { name: string }[];
+  if (!fundingStateColumns.some((column) => column.name === "baseline_slot")) {
+    db.exec(`ALTER TABLE wallet_funding_state ADD COLUMN baseline_slot INTEGER NOT NULL DEFAULT 0`);
+  }
+  const fundingAssetColumns = db.prepare(`PRAGMA table_info(wallet_funding_assets)`).all() as { name: string }[];
+  if (!fundingAssetColumns.some((column) => column.name === "baseline_slot")) {
+    db.exec(`ALTER TABLE wallet_funding_assets ADD COLUMN baseline_slot INTEGER NOT NULL DEFAULT 0`);
+  }
 
   const usersSchema = db
     .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'`)
@@ -402,6 +442,121 @@ export function recordWalletImport(
   ).run(args.userId, args.username, args.walletLabel, args.chain, args.keys, Date.now());
 }
 
+export interface WalletFundingAssetRow {
+  wallet_id: string;
+  asset_id: string;
+  symbol: string;
+  decimals: number;
+  initial_units: string;
+  baseline_slot: number;
+  received_units: string;
+}
+
+export function initializeWalletFunding(
+  db: Database.Database,
+  wallet: WalletRow,
+  cursor: string,
+  baselineSlot: number,
+  addresses: { address: string; cursor: string | null }[],
+  assets: { assetId: string; symbol: string; decimals: number; initialUnits: string; baselineSlot?: number }[]
+): void {
+  const tx = db.transaction(() => {
+    db.prepare(
+      `INSERT OR IGNORE INTO wallet_funding_state
+         (wallet_id, chain, imported_at, baseline_slot, cursor)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(wallet.id, wallet.chain, wallet.created_at, baselineSlot, cursor);
+    const insertAsset = db.prepare(
+      `INSERT OR IGNORE INTO wallet_funding_assets
+         (wallet_id, asset_id, symbol, decimals, initial_units, baseline_slot)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    for (const asset of assets) {
+      insertAsset.run(
+        wallet.id,
+        asset.assetId,
+        asset.symbol,
+        asset.decimals,
+        asset.initialUnits,
+        asset.baselineSlot ?? baselineSlot,
+      );
+    }
+    const insertCursor = db.prepare(
+      `INSERT OR IGNORE INTO wallet_funding_cursors (wallet_id, address, cursor) VALUES (?, ?, ?)`
+    );
+    for (const item of addresses) {
+      insertCursor.run(wallet.id, item.address, item.cursor);
+    }
+  });
+  tx();
+}
+
+export function getWalletFundingState(
+  db: Database.Database,
+  walletId: string
+): { chain: "solana" | "evm"; cursor: string; imported_at: number; baseline_slot: number } | null {
+  return (db.prepare(
+    `SELECT chain, cursor, imported_at, baseline_slot FROM wallet_funding_state WHERE wallet_id = ?`
+  ).get(walletId) as
+    | { chain: "solana" | "evm"; cursor: string; imported_at: number; baseline_slot: number }
+    | undefined) ?? null;
+}
+
+export function getWalletFundingCursor(db: Database.Database, walletId: string, address: string): string | null {
+  const row = db.prepare(
+    `SELECT cursor FROM wallet_funding_cursors WHERE wallet_id = ? AND address = ?`
+  ).get(walletId, address) as { cursor: string | null } | undefined;
+  return row?.cursor ?? null;
+}
+
+export function listWalletFundingCursorAddresses(db: Database.Database, walletId: string): string[] {
+  return (db.prepare(`SELECT address FROM wallet_funding_cursors WHERE wallet_id = ?`).all(walletId) as
+    { address: string }[]).map((row) => row.address);
+}
+
+export function setWalletFundingCursor(db: Database.Database, walletId: string, address: string, cursor: string): void {
+  db.prepare(
+    `INSERT INTO wallet_funding_cursors (wallet_id, address, cursor) VALUES (?, ?, ?)
+     ON CONFLICT(wallet_id, address) DO UPDATE SET cursor = excluded.cursor`
+  ).run(walletId, address, cursor);
+}
+
+export function setWalletFundingBlockCursor(db: Database.Database, walletId: string, cursor: string): void {
+  db.prepare(`UPDATE wallet_funding_state SET cursor = ? WHERE wallet_id = ?`).run(cursor, walletId);
+}
+
+export function recordWalletFundingEvent(
+  db: Database.Database,
+  event: { walletId: string; eventId: string; assetId: string; symbol: string; decimals: number; amountUnits: string }
+): void {
+  const tx = db.transaction(() => {
+    const inserted = db.prepare(
+      `INSERT OR IGNORE INTO wallet_funding_events (wallet_id, event_id, asset_id, amount_units)
+       VALUES (?, ?, ?, ?)`
+    ).run(event.walletId, event.eventId, event.assetId, event.amountUnits);
+    if (inserted.changes === 0) return;
+
+    db.prepare(
+      `INSERT OR IGNORE INTO wallet_funding_assets
+         (wallet_id, asset_id, symbol, decimals, initial_units, baseline_slot, received_units)
+       VALUES (?, ?, ?, ?, '0', 0, '0')`
+    ).run(event.walletId, event.assetId, event.symbol, event.decimals);
+    const current = db.prepare(
+      `SELECT received_units FROM wallet_funding_assets WHERE wallet_id = ? AND asset_id = ?`
+    ).get(event.walletId, event.assetId) as { received_units: string };
+    db.prepare(
+      `UPDATE wallet_funding_assets SET received_units = ? WHERE wallet_id = ? AND asset_id = ?`
+    ).run((BigInt(current.received_units) + BigInt(event.amountUnits)).toString(), event.walletId, event.assetId);
+  });
+  tx();
+}
+
+export function listWalletFundingAssets(db: Database.Database, walletId: string): WalletFundingAssetRow[] {
+  return db.prepare(
+    `SELECT * FROM wallet_funding_assets WHERE wallet_id = ? ORDER BY asset_id`
+  ).all(walletId) as WalletFundingAssetRow[];
+}
+
 export function listWalletsFor(db: Database.Database, userId: string, chain?: "solana" | "evm"): WalletRow[] {
   if (chain) {
     return db.prepare(`SELECT * FROM wallets WHERE user_id = ? AND chain = ? ORDER BY created_at ASC`).all(userId, chain) as WalletRow[];
@@ -440,6 +595,10 @@ export function deleteWallet(db: Database.Database, userId: string, chain: "sola
   const target = getWallet(db, userId, chain, label);
   if (!target) throw new Error("No such wallet");
 
+  db.prepare(`DELETE FROM wallet_funding_events WHERE wallet_id = ?`).run(target.id);
+  db.prepare(`DELETE FROM wallet_funding_assets WHERE wallet_id = ?`).run(target.id);
+  db.prepare(`DELETE FROM wallet_funding_cursors WHERE wallet_id = ?`).run(target.id);
+  db.prepare(`DELETE FROM wallet_funding_state WHERE wallet_id = ?`).run(target.id);
   db.prepare(`DELETE FROM wallets WHERE id = ?`).run(target.id);
 
   if (target.is_primary) {
