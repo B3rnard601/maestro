@@ -297,6 +297,7 @@ async function main() {
       tradeQuoteTtlSeconds: config.tradeQuoteTtlSeconds,
     },
     evmHttpProvider: evmHttp,
+    evmFactoryAddress: config.uniswapV2Factory,
   });
   await launchWithRetry(bot, config.telegramOwnerId);
   console.log("maestro running.");

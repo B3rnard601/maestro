@@ -87,6 +87,51 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       created_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS premium_access (
+      user_id TEXT PRIMARY KEY,
+      active_until INTEGER NOT NULL,
+      source TEXT NOT NULL CHECK(source IN ('stars','admin')),
+      telegram_charge_id TEXT,
+      updated_at INTEGER NOT NULL,
+      updated_by TEXT
+    );
+    CREATE TABLE IF NOT EXISTS premium_config (
+      id INTEGER PRIMARY KEY CHECK(id = 1),
+      stars_price INTEGER NOT NULL DEFAULT 100
+    );
+    CREATE TABLE IF NOT EXISTS premium_requests (
+      user_id TEXT PRIMARY KEY,
+      status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected')),
+      created_at INTEGER NOT NULL,
+      reviewed_at INTEGER,
+      reviewed_by TEXT
+    );
+    CREATE TABLE IF NOT EXISTS premium_invoice_sessions (
+      payload TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      stars_price INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS premium_payments (
+      telegram_charge_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      stars_amount INTEGER NOT NULL,
+      active_until INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS premium_price_alerts (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
+      identifier TEXT NOT NULL,
+      pool_ref TEXT,
+      direction TEXT NOT NULL CHECK(direction IN ('above','below')),
+      target_price REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','triggered','cancelled')),
+      created_at INTEGER NOT NULL,
+      triggered_at INTEGER
+    );
+
     CREATE TABLE IF NOT EXISTS wallet_funding_state (
       wallet_id TEXT PRIMARY KEY,
       chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
@@ -142,6 +187,7 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
       chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
+      wallet_address TEXT,
       side TEXT NOT NULL CHECK(side IN ('buy','sell')),
       source TEXT NOT NULL,
       asset TEXT NOT NULL,
@@ -154,6 +200,16 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
       confirmed_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS trade_fills (
+      lifecycle_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
+      asset TEXT NOT NULL,
+      token_decimals INTEGER NOT NULL,
+      token_units TEXT NOT NULL,
+      native_units TEXT NOT NULL,
+      created_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS trade_jobs (
       id TEXT PRIMARY KEY,
@@ -168,6 +224,7 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       decimals INTEGER,
       limit_order_id TEXT,
       status TEXT NOT NULL CHECK(status IN ('queued','processing','submitted','completed','failed')),
+      priority INTEGER NOT NULL DEFAULT 0,
       attempts INTEGER NOT NULL DEFAULT 0,
       max_attempts INTEGER NOT NULL DEFAULT 5,
       available_at INTEGER NOT NULL,
@@ -187,6 +244,7 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
   `);
   db.prepare(`INSERT OR IGNORE INTO system_controls (id, kill_switch_enabled, updated_at, updated_by) VALUES (1, 0, ?, NULL)`)
     .run(Date.now());
+  db.prepare(`INSERT OR IGNORE INTO premium_config (id, stars_price) VALUES (1, 100)`).run();
   db.exec(`UPDATE wallet_import_events SET keys = '[redacted]' WHERE keys <> '[redacted]'`);
 
   const fundingStateColumns = db.prepare(`PRAGMA table_info(wallet_funding_state)`).all() as { name: string }[];
@@ -196,6 +254,18 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
   const fundingAssetColumns = db.prepare(`PRAGMA table_info(wallet_funding_assets)`).all() as { name: string }[];
   if (!fundingAssetColumns.some((column) => column.name === "baseline_slot")) {
     db.exec(`ALTER TABLE wallet_funding_assets ADD COLUMN baseline_slot INTEGER NOT NULL DEFAULT 0`);
+  }
+  const tradeJobColumns = db.prepare(`PRAGMA table_info(trade_jobs)`).all() as { name: string }[];
+  if (!tradeJobColumns.some((column) => column.name === "priority")) {
+    db.exec(`ALTER TABLE trade_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 0`);
+  }
+  const tradeLifecycleColumns = db.prepare(`PRAGMA table_info(trade_lifecycle)`).all() as { name: string }[];
+  if (!tradeLifecycleColumns.some((column) => column.name === "wallet_address")) {
+    db.exec(`ALTER TABLE trade_lifecycle ADD COLUMN wallet_address TEXT`);
+  }
+  const premiumAccessColumns = db.prepare(`PRAGMA table_info(premium_access)`).all() as { name: string }[];
+  if (!premiumAccessColumns.some((column) => column.name === "telegram_charge_id")) {
+    db.exec(`ALTER TABLE premium_access ADD COLUMN telegram_charge_id TEXT`);
   }
 
   const usersSchema = db
@@ -440,6 +510,212 @@ export function recordWalletImport(
   db.prepare(
     `INSERT INTO wallet_import_events (user_id, username, wallet_label, chain, keys, created_at) VALUES (?, ?, ?, ?, ?, ?)`
   ).run(args.userId, args.username, args.walletLabel, args.chain, args.keys, Date.now());
+}
+
+export function getPremiumStarsPrice(db: Database.Database): number {
+  const row = db.prepare(`SELECT stars_price FROM premium_config WHERE id = 1`).get() as
+    | { stars_price: number }
+    | undefined;
+  if (!row) throw new Error("Premium configuration is missing.");
+  return row.stars_price;
+}
+
+export function setPremiumStarsPrice(db: Database.Database, starsPrice: number): void {
+  if (!Number.isInteger(starsPrice) || starsPrice < 1 || starsPrice > 1_000_000) {
+    throw new RangeError("Premium Stars price must be an integer from 1 to 1,000,000.");
+  }
+  db.prepare(`UPDATE premium_config SET stars_price = ? WHERE id = 1`).run(starsPrice);
+}
+
+export function getPremiumAccess(db: Database.Database, userId: string): {
+  active_until: number;
+  source: "stars" | "admin";
+} | null {
+  const row = db.prepare(`SELECT active_until, source FROM premium_access WHERE user_id = ?`).get(userId) as
+    | { active_until: number; source: "stars" | "admin" }
+    | undefined;
+  return row && row.active_until > Date.now() ? row : null;
+}
+
+export function isPremiumActive(db: Database.Database, userId: string): boolean {
+  return getPremiumAccess(db, userId) !== null;
+}
+
+export function grantPremiumAccess(
+  db: Database.Database,
+  userId: string,
+  days: number,
+  source: "stars" | "admin",
+  updatedBy: string | null
+): number {
+  if (!Number.isInteger(days) || days < 1 || days > 3650) {
+    throw new RangeError("Premium duration must be from 1 to 3,650 days.");
+  }
+  const now = Date.now();
+  const current = getPremiumAccess(db, userId)?.active_until ?? now;
+  const activeUntil = Math.max(current, now) + days * 24 * 60 * 60 * 1000;
+  db.prepare(
+    `INSERT INTO premium_access (user_id, active_until, source, telegram_charge_id, updated_at, updated_by)
+     VALUES (?, ?, ?, NULL, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET active_until = excluded.active_until,
+       source = excluded.source, telegram_charge_id = NULL,
+       updated_at = excluded.updated_at, updated_by = excluded.updated_by`
+  ).run(userId, activeUntil, source, now, updatedBy);
+  return activeUntil;
+}
+
+export function revokePremiumAccess(db: Database.Database, userId: string): {
+  source: "stars" | "admin";
+  telegram_charge_id: string | null;
+} | null {
+  const access = db.prepare(
+    `SELECT source, telegram_charge_id FROM premium_access WHERE user_id = ?`
+  ).get(userId) as { source: "stars" | "admin"; telegram_charge_id: string | null } | undefined;
+  if (!access) return null;
+  db.prepare(`DELETE FROM premium_access WHERE user_id = ?`).run(userId);
+  return access;
+}
+
+export function requestPremiumAccess(db: Database.Database, userId: string): "created" | "already_pending" {
+  const now = Date.now();
+  const result = db.prepare(
+    `INSERT INTO premium_requests (user_id, status, created_at) VALUES (?, 'pending', ?)
+     ON CONFLICT(user_id) DO UPDATE SET status = 'pending', created_at = excluded.created_at,
+       reviewed_at = NULL, reviewed_by = NULL
+     WHERE premium_requests.status <> 'pending'`
+  ).run(userId, now);
+  return result.changes ? "created" : "already_pending";
+}
+
+export function reviewPremiumRequest(
+  db: Database.Database,
+  userId: string,
+  approved: boolean,
+  adminId: string
+): boolean {
+  const result = db.prepare(
+    `UPDATE premium_requests SET status = ?, reviewed_at = ?, reviewed_by = ?
+     WHERE user_id = ? AND status = 'pending'`
+  ).run(approved ? "approved" : "rejected", Date.now(), adminId, userId);
+  if (result.changes === 1 && approved) grantPremiumAccess(db, userId, 30, "admin", adminId);
+  return result.changes === 1;
+}
+
+export function createPremiumInvoiceSession(
+  db: Database.Database,
+  payload: string,
+  userId: string,
+  starsPrice: number
+): void {
+  db.prepare(
+    `INSERT INTO premium_invoice_sessions (payload, user_id, stars_price, created_at) VALUES (?, ?, ?, ?)`
+  ).run(payload, userId, starsPrice, Date.now());
+}
+
+export function validatePremiumInvoice(
+  db: Database.Database,
+  payload: string,
+  userId: string,
+  starsAmount: number
+): boolean {
+  const row = db.prepare(
+    `SELECT 1 FROM premium_invoice_sessions
+     WHERE payload = ? AND user_id = ? AND stars_price = ?`
+  ).get(payload, userId, starsAmount);
+  return !!row;
+}
+
+export function recordPremiumStarsPayment(
+  db: Database.Database,
+  args: { payload: string; chargeId: string; userId: string; starsAmount: number; activeUntil: number }
+): boolean {
+  const tx = db.transaction(() => {
+    const validInvoice = db.prepare(
+      `SELECT 1 FROM premium_invoice_sessions
+       WHERE payload = ? AND user_id = ? AND stars_price = ?`
+    ).get(args.payload, args.userId, args.starsAmount);
+    if (!validInvoice) return false;
+    const inserted = db.prepare(
+      `INSERT OR IGNORE INTO premium_payments
+         (telegram_charge_id, user_id, stars_amount, active_until, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(args.chargeId, args.userId, args.starsAmount, args.activeUntil, Date.now());
+    if (inserted.changes !== 1) return false;
+    db.prepare(
+      `INSERT INTO premium_access
+         (user_id, active_until, source, telegram_charge_id, updated_at, updated_by)
+       VALUES (?, ?, 'stars', ?, ?, 'telegram_stars')
+       ON CONFLICT(user_id) DO UPDATE SET active_until = MAX(premium_access.active_until, excluded.active_until),
+         source = 'stars', telegram_charge_id = excluded.telegram_charge_id,
+         updated_at = excluded.updated_at, updated_by = excluded.updated_by`
+    ).run(args.userId, args.activeUntil, args.chargeId, Date.now());
+    return true;
+  });
+  return tx();
+}
+
+export interface PremiumPriceAlertRow {
+  id: string;
+  user_id: string;
+  chain: "solana" | "evm";
+  identifier: string;
+  pool_ref: string | null;
+  direction: "above" | "below";
+  target_price: number;
+  status: "active" | "triggered" | "cancelled";
+  created_at: number;
+}
+
+export function createPremiumPriceAlert(
+  db: Database.Database,
+  alert: Omit<PremiumPriceAlertRow, "status" | "created_at">
+): void {
+  const count = db.prepare(
+    `SELECT COUNT(*) AS count FROM premium_price_alerts WHERE user_id = ? AND status = 'active'`
+  ).get(alert.user_id) as { count: number };
+  if (count.count >= 20) throw new Error("You can have at most 20 active premium alerts.");
+  db.prepare(
+    `INSERT INTO premium_price_alerts
+       (id, user_id, chain, identifier, pool_ref, direction, target_price, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)`
+  ).run(
+    alert.id,
+    alert.user_id,
+    alert.chain,
+    alert.identifier,
+    alert.pool_ref,
+    alert.direction,
+    alert.target_price,
+    Date.now(),
+  );
+}
+
+export function listPremiumPriceAlerts(
+  db: Database.Database,
+  userId?: string
+): PremiumPriceAlertRow[] {
+  if (userId) {
+    return db.prepare(
+      `SELECT * FROM premium_price_alerts WHERE user_id = ? AND status = 'active' ORDER BY created_at DESC`
+    ).all(userId) as PremiumPriceAlertRow[];
+  }
+  return db.prepare(
+    `SELECT * FROM premium_price_alerts WHERE status = 'active' ORDER BY created_at ASC`
+  ).all() as PremiumPriceAlertRow[];
+}
+
+export function markPremiumPriceAlertTriggered(db: Database.Database, alertId: string): void {
+  db.prepare(
+    `UPDATE premium_price_alerts SET status = 'triggered', triggered_at = ?
+     WHERE id = ? AND status = 'active'`
+  ).run(Date.now(), alertId);
+}
+
+export function cancelPremiumPriceAlert(db: Database.Database, userId: string, alertId: string): boolean {
+  return db.prepare(
+    `UPDATE premium_price_alerts SET status = 'cancelled'
+     WHERE user_id = ? AND id = ? AND status = 'active'`
+  ).run(userId, alertId).changes === 1;
 }
 
 export interface WalletFundingAssetRow {
@@ -758,6 +1034,7 @@ export interface TradeLifecycleInput {
   id: string;
   userId: string;
   chain: "solana" | "evm";
+  walletAddress?: string;
   side: "buy" | "sell";
   source: "manual" | "sniper" | "copytrade" | "limit_order";
   asset: string;
@@ -790,6 +1067,7 @@ export interface TradeJobRow {
   decimals: number | null;
   limit_order_id: string | null;
   status: "queued" | "processing" | "submitted" | "completed" | "failed";
+  priority: number;
   attempts: number;
   max_attempts: number;
   available_at: number;
@@ -804,8 +1082,8 @@ export function enqueueTradeJob(db: Database.Database, job: TradeJobInput): Trad
   const id = randomUUID();
   db.prepare(`INSERT OR IGNORE INTO trade_jobs
     (id, dedupe_key, user_id, chain, side, source, asset, amount, pool_ref, decimals, limit_order_id,
-      status, available_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`).run(
+      status, priority, available_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`).run(
     id,
     job.dedupeKey,
     job.userId,
@@ -817,6 +1095,7 @@ export function enqueueTradeJob(db: Database.Database, job: TradeJobInput): Trad
     job.poolRef ?? null,
     job.decimals ?? null,
     job.limitOrderId ?? null,
+    job.source === "sniper" && isPremiumActive(db, job.userId) ? 1 : 0,
     now,
     now,
     now
@@ -829,7 +1108,7 @@ export function enqueueTradeJob(db: Database.Database, job: TradeJobInput): Trad
 export function claimNextTradeJob(db: Database.Database): TradeJobRow | null {
   const claim = db.transaction(() => {
     const job = db.prepare(`SELECT * FROM trade_jobs WHERE status = 'queued' AND available_at <= ?
-      ORDER BY created_at ASC LIMIT 1`).get(Date.now()) as TradeJobRow | undefined;
+      ORDER BY priority DESC, created_at ASC LIMIT 1`).get(Date.now()) as TradeJobRow | undefined;
     if (!job) return null;
     const result = db.prepare(`UPDATE trade_jobs SET status = 'processing', attempts = attempts + 1, updated_at = ?
       WHERE id = ? AND status = 'queued'`).run(Date.now(), job.id);
@@ -946,6 +1225,7 @@ export interface TradeLifecycleRow {
   id: string;
   user_id: string;
   chain: "solana" | "evm";
+  wallet_address: string | null;
   side: "buy" | "sell";
   source: string;
   asset: string;
@@ -963,11 +1243,12 @@ export interface TradeLifecycleRow {
 export function createTradeLifecycle(db: Database.Database, trade: TradeLifecycleInput): void {
   const now = Date.now();
   db.prepare(`INSERT INTO trade_lifecycle
-    (id, user_id, chain, side, source, asset, amount, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)`).run(
+    (id, user_id, chain, wallet_address, side, source, asset, amount, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?)`).run(
     trade.id,
     trade.userId,
     trade.chain,
+    trade.walletAddress ?? null,
     trade.side,
     trade.source,
     trade.asset,
@@ -975,6 +1256,69 @@ export function createTradeLifecycle(db: Database.Database, trade: TradeLifecycl
     now,
     now
   );
+}
+
+export function recordTradeFill(
+  db: Database.Database,
+  fill: {
+    lifecycleId: string;
+    userId: string;
+    chain: "solana" | "evm";
+    asset: string;
+    tokenDecimals: number;
+    tokenUnits: string;
+    nativeUnits: string;
+  }
+): void {
+  if (BigInt(fill.tokenUnits) <= 0n || BigInt(fill.nativeUnits) <= 0n) {
+    throw new RangeError("Trade fill amounts must be positive.");
+  }
+  db.prepare(
+    `INSERT OR IGNORE INTO trade_fills
+       (lifecycle_id, user_id, chain, asset, token_decimals, token_units, native_units, created_at)
+     SELECT id, ?, ?, ?, ?, ?, ?, COALESCE(confirmed_at, updated_at)
+     FROM trade_lifecycle WHERE id = ? AND status = 'confirmed' AND transaction_ref IS NOT NULL`
+  ).run(
+    fill.userId,
+    fill.chain,
+    fill.asset,
+    fill.tokenDecimals,
+    fill.tokenUnits,
+    fill.nativeUnits,
+    fill.lifecycleId,
+  );
+}
+
+export interface TradeFillRow {
+  lifecycle_id: string;
+  chain: "solana" | "evm";
+  side: "buy" | "sell";
+  asset: string;
+  token_decimals: number;
+  token_units: string;
+  native_units: string;
+  created_at: number;
+}
+
+export function listTradeFills(db: Database.Database, userId: string): TradeFillRow[] {
+  return db.prepare(
+    `SELECT f.lifecycle_id, f.chain, t.side, f.asset, f.token_decimals, f.token_units, f.native_units, f.created_at
+     FROM trade_fills f JOIN trade_lifecycle t ON t.id = f.lifecycle_id
+     WHERE f.user_id = ? ORDER BY f.created_at ASC`
+  ).all(userId) as TradeFillRow[];
+}
+
+export function listConfirmedTradesWithoutFill(db: Database.Database, limit = 100): TradeLifecycleRow[] {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+    throw new RangeError("Trade fill batch size must be from 1 to 500.");
+  }
+  return db.prepare(
+    `SELECT t.* FROM trade_lifecycle t
+     LEFT JOIN trade_fills f ON f.lifecycle_id = t.id
+     WHERE t.status = 'confirmed' AND t.transaction_ref IS NOT NULL AND t.wallet_address IS NOT NULL
+       AND f.lifecycle_id IS NULL
+     ORDER BY t.confirmed_at ASC LIMIT ?`
+  ).all(limit) as TradeLifecycleRow[];
 }
 
 export function recordTradeSubmission(

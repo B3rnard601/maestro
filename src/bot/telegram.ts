@@ -34,8 +34,14 @@ import {
   initializeSolanaFunding,
   updateWalletFunding,
 } from "../portfolio/funding.js";
+import { formatNativeAmount, getRealizedPnl } from "../premium/analytics.js";
+import { startPremiumAlertWatcher } from "../premium/alerts.js";
 import {
+  cancelPremiumPriceAlert,
+  createPremiumPriceAlert,
   getHoldings,
+  getPremiumAccess,
+  getPremiumStarsPrice,
   getSystemControls,
   getOrCreateUser,
   getUser,
@@ -50,11 +56,21 @@ import {
   getWallet,
   setPrimaryWallet,
   recordWalletImport,
+  createPremiumInvoiceSession,
+  grantPremiumAccess,
+  isPremiumActive,
+  recordPremiumStarsPayment,
+  requestPremiumAccess,
+  reviewPremiumRequest,
+  revokePremiumAccess,
+  setPremiumStarsPrice,
+  validatePremiumInvoice,
   getPrimaryWallet,
   recordHolding,
   recordSecurityEvent,
   listRecentTradesForUser,
   listRecentTradeJobsForUser,
+  listPremiumPriceAlerts,
 } from "../db/db.js";
 import {
   executeBuy as executeSolanaBuy,
@@ -85,6 +101,11 @@ const USER_COMMANDS = [
   { command: "wallets", description: "Manage or import wallets" },
   { command: "cancel_import", description: "Cancel wallet import" },
   { command: "portfolio", description: "View portfolio balances" },
+  { command: "premium", description: "View or subscribe to premium" },
+  { command: "premium_report", description: "View premium realized P&L" },
+  { command: "premium_alert", description: "Create a premium price alert" },
+  { command: "premium_alerts", description: "List active premium price alerts" },
+  { command: "premium_alert_cancel", description: "Cancel a premium price alert" },
   { command: "snipe_on", description: "Enable auto-buy" },
   { command: "snipe_off", description: "Disable auto-buy" },
   { command: "snipe_size", description: "Set auto-buy size" },
@@ -106,6 +127,9 @@ const ADMIN_COMMANDS = [
   { command: "admin_stats", description: "Show user and trading stats" },
   { command: "admin_flag", description: "Flag a user with a custom message" },
   { command: "admin_unflag", description: "Clear a user's flag" },
+  { command: "admin_premium_price", description: "Set the monthly premium price in Stars" },
+  { command: "admin_premium_grant", description: "Grant premium to a user for a number of days" },
+  { command: "admin_premium_revoke", description: "Terminate a user's premium access" },
 ];
 
 export async function configureBotCommands(
@@ -125,6 +149,7 @@ export interface BotDeps {
   solConnection: Connection;
   evmProvider: Provider;
   evmHttpProvider: JsonRpcProvider;
+  evmFactoryAddress: string;
   adminBootstrapId: string;
   tradingLimits: Pick<
     AppConfig,
@@ -155,6 +180,7 @@ function homeKeyboard(isAdmin: boolean) {
       Markup.button.callback("🔁 Copy trading", "home_copytrade"),
     ],
     [Markup.button.callback("⚙️ Trading settings", "home_risk_settings")],
+    [Markup.button.callback("⭐ Premium", "home_premium")],
     [
       Markup.button.callback("📈 Orders", "home_orders"),
       Markup.button.callback("🧾 Recent trades", "home_trades"),
@@ -198,11 +224,23 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     solConnection,
     evmProvider,
     evmHttpProvider,
+    evmFactoryAddress,
     tradingLimits,
   } = deps;
   const bot = new Telegraf(token);
   const adminBootstrapId = deps.adminBootstrapId;
   const pendingImport = new Map<number, PendingImport>();
+  startPremiumAlertWatcher({
+    db,
+    solConnection,
+    evmProvider: evmHttpProvider,
+    evmFactory: evmFactoryAddress,
+    loadSolanaWallet: (userId) => {
+      const wallet = getPrimaryWallet(db, userId, "solana");
+      return wallet ? loadSolanaKeypair(vault, db, userId, wallet.label) : null;
+    },
+    notify: (userId, text) => bot.telegram.sendMessage(userId, text),
+  });
 
   if (!adminBootstrapId) {
     console.warn(
@@ -829,6 +867,9 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       lifecycle = beginTrackedTrade(db, {
         userId: quote.userId,
         chain: quote.chain,
+        walletAddress: quote.chain === "solana"
+          ? getSolanaTradeWallet(quote.userId).publicKey.toBase58()
+          : getEvmTradeWallet(quote.userId).address,
         side: quote.side,
         source: "manual",
         asset: quote.asset,
@@ -978,6 +1019,252 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       HELP_TEXT + (user?.role === "admin" ? "\n" + ADMIN_HELP_TEXT : ""),
       homeKeyboard(user?.role === "admin"),
     );
+  });
+
+  async function showPremium(ctx: any): Promise<void> {
+    const userId = String(ctx.from!.id);
+    const access = getPremiumAccess(db, userId);
+    const price = getPremiumStarsPrice(db);
+    const status = access
+      ? `✅ PREMIUM ACTIVE until ${new Date(access.active_until).toLocaleDateString("en-GB")}`
+      : "⚪ FREE PLAN";
+    const rows = [];
+    if (!access) rows.push([Markup.button.callback(`⭐ Subscribe · ${price} Stars/month`, "premium_stars_buy")]);
+    if (access) {
+      rows.push([Markup.button.callback("📈 Realized P&L", "premium_report")]);
+      rows.push([Markup.button.callback("🔔 Price alerts", "premium_alerts")]);
+    }
+    rows.push([Markup.button.callback("✉️ Request admin subscription", "premium_request")]);
+    rows.push([Markup.button.callback("↩️ Home", "home")]);
+    await ctx.reply(
+      `${tradingHeading("⭐", "Premium")}\n${status}\n\nPremium includes priority auto-buy queueing, realized P&L for confirmed Maestro trades, and proactive price alerts. Existing trading controls stay free.\n\nTelegram Stars billing renews monthly. An admin can also approve a request or grant/revoke access directly.${access ? "\n\nCreate an alert:\n/premium_alert <solana|evm> <token> <pool_id|-> <above|below> <price>\nFor Solana, provide the Raydium pool ID; for EVM use -." : ""}`,
+      Markup.inlineKeyboard(rows),
+    );
+  }
+
+  async function sendPremiumReport(ctx: any): Promise<void> {
+    const userId = String(ctx.from!.id);
+    if (!isPremiumActive(db, userId)) return ctx.reply("Premium is required for realized P&L reports. Use /premium to subscribe.");
+    const reports = getRealizedPnl(db, userId);
+    if (reports.length === 0) {
+      return ctx.reply(
+        `${tradingHeading("📈", "Realized P&L")}\nNo confirmed trades have been captured since P&L tracking began.`,
+      );
+    }
+    const lines = [
+      tradingHeading("📈", "Realized P&L"),
+      "FIFO cost basis · confirmed Maestro trades only",
+      "Network fees excluded. Trades before tracking launched are not backfilled.",
+      "",
+      ...reports.map((report) =>
+        `${report.chain.toUpperCase()}: ${formatNativeAmount(report.realizedUnits, report.nativeDecimals)} ${report.nativeSymbol} · ${report.matchedSells} matched sells · ${report.confirmedFills} fills${report.unmatchedSells ? ` · ${report.unmatchedSells} unmatched sells excluded` : ""}`,
+      ),
+    ];
+    await ctx.reply(lines.join("\n"));
+  }
+
+  bot.command("premium_report", (ctx) => sendPremiumReport(ctx));
+  bot.action("premium_report", async (ctx) => {
+    await ctx.answerCbQuery();
+    await sendPremiumReport(ctx);
+  });
+
+  bot.command("premium_alert", async (ctx) => {
+    const userId = String(ctx.from!.id);
+    if (!isPremiumActive(db, userId)) return ctx.reply("Premium is required for price alerts. Use /premium to subscribe.");
+    const [, chain, rawIdentifier, rawPool, direction, rawPrice] = ctx.message.text.trim().split(/\s+/);
+    const price = Number(rawPrice);
+    if (
+      (chain !== "solana" && chain !== "evm") ||
+      !rawIdentifier ||
+      !rawPool ||
+      (direction !== "above" && direction !== "below") ||
+      !Number.isFinite(price) ||
+      price <= 0
+    ) {
+      return ctx.reply(
+        "Usage: /premium_alert <solana|evm> <token> <pool_id|-> <above|below> <price>\nSolana requires a Raydium pool ID; EVM uses -.",
+      );
+    }
+    let identifier = rawIdentifier;
+    let poolRef: string | null = null;
+    if (chain === "solana") {
+      try {
+        identifier = new PublicKey(rawIdentifier).toBase58();
+        if (!rawPool || rawPool === "-") throw new Error("A Raydium pool ID is required.");
+        poolRef = new PublicKey(rawPool).toBase58();
+      } catch (err) {
+        return ctx.reply(`Invalid Solana mint or pool ID: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      if (!isAddress(rawIdentifier)) return ctx.reply("Enter a valid EVM token contract address.");
+      if (rawPool !== "-") return ctx.reply("Use - for the EVM pool ID; the configured WETH pair is used.");
+      identifier = getAddress(rawIdentifier);
+    }
+    const id = randomUUID();
+    try {
+      createPremiumPriceAlert(db, {
+        id,
+        user_id: userId,
+        chain,
+        identifier,
+        pool_ref: poolRef,
+        direction,
+        target_price: price,
+      });
+      await ctx.reply(
+        `${tradingHeading("🔔", "Premium alert created")}\n${chain.toUpperCase()} ${identifier}\nNotify when price is ${direction} ${price}\nAlert ID: ${id.slice(0, 8)}`,
+      );
+    } catch (err) {
+      await ctx.reply(`Couldn't create alert: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  async function sendPremiumAlerts(ctx: any): Promise<void> {
+    const userId = String(ctx.from!.id);
+    if (!isPremiumActive(db, userId)) return ctx.reply("Premium is required for price alerts. Use /premium to subscribe.");
+    const alerts = listPremiumPriceAlerts(db, userId);
+    if (alerts.length === 0) {
+      return ctx.reply(
+        `${tradingHeading("🔔", "Price alerts")}\nNo active alerts.\n\nUse /premium for instructions to create one.`,
+      );
+    }
+    await ctx.reply(
+      `${tradingHeading("🔔", "Price alerts")}\n${alerts.map((alert) =>
+        `${alert.id.slice(0, 8)} · ${alert.chain.toUpperCase()} ${alert.identifier.slice(0, 12)} · ${alert.direction} ${alert.target_price}`,
+      ).join("\n")}\n\nCancel with /premium_alert_cancel <alert_id>`,
+    );
+  }
+  bot.command("premium_alerts", (ctx) => sendPremiumAlerts(ctx));
+  bot.action("premium_alerts", async (ctx) => {
+    await ctx.answerCbQuery();
+    await sendPremiumAlerts(ctx);
+  });
+
+  bot.command("premium_alert_cancel", async (ctx) => {
+    const [, id] = ctx.message.text.trim().split(/\s+/);
+    if (!id) return ctx.reply("Usage: /premium_alert_cancel <alert_id>");
+    const userId = String(ctx.from!.id);
+    if (!cancelPremiumPriceAlert(db, userId, id)) return ctx.reply("No active alert found with that ID.");
+    return ctx.reply(`Cancelled price alert ${id.slice(0, 8)}.`);
+  });
+
+  bot.command("premium", (ctx) => showPremium(ctx));
+  bot.action("home_premium", async (ctx) => {
+    await ctx.answerCbQuery();
+    await showPremium(ctx);
+  });
+
+  bot.action("premium_stars_buy", async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = String(ctx.from!.id);
+    const starsPrice = getPremiumStarsPrice(db);
+    const payload = `premium:${userId}:${randomUUID()}`;
+    createPremiumInvoiceSession(db, payload, userId, starsPrice);
+    const invoice = {
+      title: "Maestro Premium",
+      description: "One month of Maestro Premium features.",
+      payload,
+      provider_token: "",
+      currency: "XTR",
+      prices: [{ label: "Premium · 1 month", amount: starsPrice }],
+      start_parameter: `premium-${randomUUID()}`,
+    };
+    const subscriptionOptions = { subscription_period: 2_592_000 };
+    try {
+      // The installed Telegraf types predate Telegram's Stars subscription_period field.
+      await ctx.telegram.sendInvoice(ctx.chat!.id, invoice, subscriptionOptions as never);
+    } catch (err) {
+      console.error(`[premium] invoice creation failed for ${userId}:`, err);
+      await ctx.reply("Couldn't create the Stars subscription invoice. Please try again later.");
+    }
+  });
+
+  bot.on("pre_checkout_query", async (ctx) => {
+    const query = ctx.preCheckoutQuery;
+    const valid =
+      query.currency === "XTR" &&
+      validatePremiumInvoice(db, query.invoice_payload, String(query.from.id), query.total_amount);
+    await ctx.answerPreCheckoutQuery(
+      valid,
+      valid ? undefined : "This premium invoice is invalid or has expired. Please request a new one.",
+    );
+  });
+
+  bot.on("successful_payment", async (ctx) => {
+    const payment = ctx.message.successful_payment as typeof ctx.message.successful_payment & {
+      subscription_expiration_date?: number;
+    };
+    const userId = String(ctx.from!.id);
+    if (
+      payment.currency !== "XTR" ||
+      !validatePremiumInvoice(db, payment.invoice_payload, userId, payment.total_amount)
+    ) {
+      console.error(`[premium] rejected unexpected payment update for user ${userId}`);
+      await ctx.reply("Payment received but couldn't be matched to a valid premium invoice. Contact an admin.");
+      return;
+    }
+
+    const currentUntil = getPremiumAccess(db, userId)?.active_until ?? Date.now();
+    const activeUntil = payment.subscription_expiration_date
+      ? payment.subscription_expiration_date * 1000
+      : Math.max(currentUntil, Date.now()) + 30 * 24 * 60 * 60 * 1000;
+    const recorded = recordPremiumStarsPayment(db, {
+      payload: payment.invoice_payload,
+      chargeId: payment.telegram_payment_charge_id,
+      userId,
+      starsAmount: payment.total_amount,
+      activeUntil,
+    });
+    if (!recorded) {
+      console.warn(`[premium] duplicate or unrecognized Stars charge ${payment.telegram_payment_charge_id}`);
+      return;
+    }
+    await ctx.reply(
+      `⭐ Premium activated until ${new Date(activeUntil).toLocaleDateString("en-GB")}. Thanks for subscribing!`,
+    );
+  });
+
+  bot.action("premium_request", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!adminBootstrapId) return ctx.reply("Admin subscriptions are unavailable right now.");
+    const userId = String(ctx.from!.id);
+    if (isPremiumActive(db, userId)) return ctx.reply("Your premium access is already active.");
+    const result = requestPremiumAccess(db, userId);
+    if (result === "already_pending") return ctx.reply("Your premium request is already awaiting admin review.");
+    try {
+      await bot.telegram.sendMessage(
+        adminBootstrapId,
+        `Premium access request\nUser: ${userId}${ctx.from!.username ? ` (@${ctx.from!.username})` : ""}`,
+        Markup.inlineKeyboard([[
+          Markup.button.callback("✅ Approve 30 days", `premium_approve_${userId}`),
+          Markup.button.callback("Reject", `premium_reject_${userId}`),
+        ]]),
+      );
+      await ctx.reply("Your request was sent to an admin for approval.");
+    } catch (err) {
+      console.error(`[premium] couldn't send request for ${userId} to admin:`, err);
+      await ctx.reply("Couldn't notify an admin right now. Please try again later.");
+    }
+  });
+
+  bot.action(/^premium_(approve|reject)_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    const [, decision, userId] = ctx.match as unknown as [string, "approve" | "reject", string];
+    const approved = decision === "approve";
+    if (!reviewPremiumRequest(db, userId, approved, String(ctx.from!.id))) {
+      return ctx.reply("That premium request is no longer pending.");
+    }
+    await ctx.reply(approved ? `Premium approved for ${userId} for 30 days.` : `Premium request rejected for ${userId}.`);
+    try {
+      await bot.telegram.sendMessage(
+        userId,
+        approved ? "Your premium request was approved for 30 days." : "Your premium request was declined.",
+      );
+    } catch (err) {
+      console.error(`[premium] couldn't notify user ${userId} of request review:`, err);
+    }
   });
 
   async function showSnipeSettings(ctx: any) {
@@ -3091,6 +3378,54 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const error = activateUserWithImportedWallet(telegramId);
     if (error) return ctx.reply(error);
     ctx.reply(`Unbanned ${telegramId}.`);
+  });
+
+  bot.command("admin_premium_price", (ctx) => {
+    if (!requireAdmin(ctx)) return;
+    const [, rawPrice] = ctx.message.text.trim().split(/\s+/);
+    const starsPrice = Number(rawPrice);
+    if (!Number.isInteger(starsPrice) || starsPrice < 1 || starsPrice > 1_000_000) {
+      return ctx.reply("Usage: /admin_premium_price <1-1000000 Stars>");
+    }
+    setPremiumStarsPrice(db, starsPrice);
+    return ctx.reply(`Monthly premium price set to ${starsPrice} Telegram Stars.`);
+  });
+
+  bot.command("admin_premium_grant", (ctx) => {
+    if (!requireAdmin(ctx)) return;
+    const [, userId, rawDays] = ctx.message.text.trim().split(/\s+/);
+    const days = Number(rawDays);
+    if (!userId || !Number.isInteger(days) || days < 1 || days > 3650) {
+      return ctx.reply("Usage: /admin_premium_grant <telegram_id> <1-3650 days>");
+    }
+    if (!getUser(db, userId)) return ctx.reply("No user with that Telegram ID is registered.");
+    const activeUntil = grantPremiumAccess(db, userId, days, "admin", String(ctx.from!.id));
+    ctx.reply(`Granted premium to ${userId} until ${new Date(activeUntil).toLocaleString("en-GB")}.`);
+    bot.telegram.sendMessage(
+      userId,
+      `An admin granted you premium access until ${new Date(activeUntil).toLocaleDateString("en-GB")}.`,
+    ).catch((err) => console.error(`[premium] couldn't notify user ${userId} of manual grant:`, err));
+  });
+
+  bot.command("admin_premium_revoke", (ctx) => {
+    if (!requireAdmin(ctx)) return;
+    const [, userId] = ctx.message.text.trim().split(/\s+/);
+    if (!userId) return ctx.reply("Usage: /admin_premium_revoke <telegram_id>");
+    const access = revokePremiumAccess(db, userId);
+    if (!access) return ctx.reply("That user has no premium access to terminate.");
+    ctx.reply(`Terminated premium access for ${userId}.`);
+    if (access.source === "stars" && access.telegram_charge_id) {
+      bot.telegram.callApi(
+        "editUserStarSubscription" as never,
+        {
+          user_id: Number(userId),
+          telegram_payment_charge_id: access.telegram_charge_id,
+          is_canceled: true,
+        } as never,
+      ).catch((err) => console.error(`[premium] couldn't cancel Stars renewal for ${userId}:`, err));
+    }
+    bot.telegram.sendMessage(userId, "An admin has terminated your premium access.")
+      .catch((err) => console.error(`[premium] couldn't notify user ${userId} of termination:`, err));
   });
 
   bot.command("admin_stats", (ctx) => {

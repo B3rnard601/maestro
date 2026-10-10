@@ -6,6 +6,7 @@ import {
   listStalePreparedTrades,
   updateTradeLifecycle,
 } from "../db/db.js";
+import { captureConfirmedTradeFills } from "../premium/fills.js";
 
 const UNKNOWN_AFTER_MS = 15 * 60_000;
 const PREPARED_STALE_AFTER_MS = 2 * 60_000;
@@ -39,6 +40,7 @@ export function startTradeReconciler(
                 updateTradeLifecycle(db, trade.id, "confirmed");
               }
             }
+            await captureConfirmedTradeFills(db, solConnection, evmProvider);
           } else if (trade.transaction_ref) {
             const result = await solConnection.getSignatureStatuses(
               [trade.transaction_ref],
