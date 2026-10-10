@@ -89,6 +89,7 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
       const lifecycle = beginTrackedTrade(db, {
         userId: job.user_id,
         chain: job.chain,
+        walletAddress: job.chain === "solana" ? solWallet!.publicKey.toBase58() : evmWallet!.address,
         side: job.side,
         source: job.source,
         asset: job.asset,
