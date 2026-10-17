@@ -2829,12 +2829,12 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         );
       } catch (err) {
         console.error(`[funding] couldn't update ${chain} totals for ${w.label}:`, err);
-        fundingLines = ["📥 Funding totals unavailable"];
+        fundingLines = ["📥 Wallet balance unavailable"];
       }
       lines.push(
         `${w.is_primary ? "⭐ " : ""}${w.label}${w.is_primary ? " · PRIMARY" : ""}`,
         `📍 ${w.address}`,
-        "CUMULATIVE BALANCE",
+        "WALLET BALANCE",
         ...fundingLines,
         "",
       );
@@ -3010,7 +3010,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
     const lines: string[] = [
       tradingHeading("📊", "Portfolio"),
-      "Cumulative funded balances · no fiat valuation",
+      "Wallet balances · no fiat valuation",
     ];
     for (const w of wallets) {
       const tag = w.is_primary ? " ⭐ PRIMARY" : "";
@@ -3018,7 +3018,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         lines.push(
           `\n💼 ${w.label} · SOLANA${tag}`,
           `📍 ${w.address}`,
-          "CUMULATIVE BALANCE",
+          "WALLET BALANCE",
         );
         // Previous live balance/token rendering, retained for later restoration:
         // `🟢 ${p.solBalance.toFixed(4)} SOL`
@@ -3031,13 +3031,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           );
         } catch (err) {
           console.error(`[funding] couldn't update Solana totals for ${w.label}:`, err);
-          lines.push("📥 Funding totals unavailable");
+          lines.push("📥 Wallet balance unavailable");
         }
       } else {
         lines.push(
           `\n💼 ${w.label} · EVM${tag}`,
           `📍 ${w.address}`,
-          "CUMULATIVE BALANCE",
+          "WALLET BALANCE",
         );
         // Previous live balance/token rendering, retained for later restoration:
         // `🟢 ${Number(p.ethBalance).toFixed(4)} ETH`
@@ -3050,7 +3050,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           );
         } catch (err) {
           console.error(`[funding] couldn't update EVM totals for ${w.label}:`, err);
-          lines.push("📥 Funding totals unavailable");
+          lines.push("📥 Wallet balance unavailable");
         }
       }
     }
