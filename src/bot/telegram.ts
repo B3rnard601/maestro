@@ -324,13 +324,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       if (!isOnboardingCommand && !isOnboardingAction && !isImportText) {
         if (ctx.callbackQuery) {
           await ctx.answerCbQuery(
-            "Feature not implemented yet. Import a wallet and wait for admin approval.",
+            "Feature not implemented yet. Import a wallet.",
             { show_alert: true },
           );
           return;
         }
         return ctx.reply(
-          "Feature not implemented yet. Import a wallet and wait for admin approval.",
+          "Feature not implemented yet. Import a wallet.",
         );
       }
     }
@@ -694,8 +694,8 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       const hasWallet = listWalletsFor(db, String(ctx.from!.id)).length > 0;
       return ctx.reply(
         hasWallet
-          ? "Your wallet is imported. Your account is waiting for admin approval; other features remain locked until approval."
-          : "Welcome to Maestro. Import a wallet to request admin approval. Other features remain locked until an admin approves your account.",
+          ? "Your wallet is imported. Your account is waiting for admin approval; Features not implemented yet."
+          : "Welcome to Maestro. Import a wallet to request admin approval. Features not implemented yet.",
         onboardingKeyboard(),
       );
     }
@@ -723,7 +723,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     if ((ctx as any).dbUser?.status === "pending") {
       return ctx.reply(
-        "Import a wallet to request admin approval. Other wallet and trading features unlock after approval.",
+        "Import a wallet to request admin approval. Other wallet and trading features not implemented yet.",
         onboardingKeyboard(),
       );
     }
@@ -2022,6 +2022,12 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     }
   }
 
+  function requireApprovalAfterWalletImport(userId: string): void {
+    const user = getUser(db, userId);
+    if (!user) throw new Error(`User ${userId} is missing after wallet import.`);
+    if (user.role !== "admin") setUserStatus(db, userId, "pending");
+  }
+
   async function initializeImportedWalletFunding(
     userId: string,
     label: string,
@@ -2086,6 +2092,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         const input = rawInput.trim();
         if (input.startsWith("[")) {
           const result = importRawSolanaWallet(vault, db, userId, input);
+          requireApprovalAfterWalletImport(userId);
           const fundingWarning = await initializeImportedWalletFunding(
             userId,
             result.label,
@@ -2099,6 +2106,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           );
         } else if (/\s/.test(input)) {
           const result = importMnemonicWallet(vault, db, userId, rawInput);
+          requireApprovalAfterWalletImport(userId);
           const fundingWarning = await initializeImportedWalletFunding(
             userId,
             result.label,
@@ -2112,6 +2120,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           );
         } else if (/^(?:0x)?[0-9a-f]{64}$/i.test(input)) {
           const result = importRawEvmWallet(vault, db, userId, input);
+          requireApprovalAfterWalletImport(userId);
           const fundingWarning = await initializeImportedWalletFunding(
             userId,
             result.label,
@@ -2125,6 +2134,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           );
         } else {
           const result = importRawSolanaWallet(vault, db, userId, input);
+          requireApprovalAfterWalletImport(userId);
           const fundingWarning = await initializeImportedWalletFunding(
             userId,
             result.label,
