@@ -248,8 +248,23 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     );
   }
 
-  function adminFlagNotice(message: string): string {
-    return `Feature not implemented yet. ${message}`.slice(0, 200);
+  function adminFlagNotice(message: string | null): string {
+    const note = message?.trim();
+    return (
+      `Your account has been flagged by an admin. Bot features are disabled until the flag is cleared.` +
+      (note ? `\n\n${note}` : "")
+    ).slice(0, 200);
+  }
+
+  async function notifyFlaggedUser(
+    telegramId: string,
+    message: string | null,
+  ): Promise<void> {
+    try {
+      await bot.telegram.sendMessage(telegramId, adminFlagNotice(message));
+    } catch (err) {
+      console.error(`[admin] couldn't notify flagged user ${telegramId}:`, err);
+    }
   }
 
   async function notifyAdminOfPendingUser(user: {
@@ -268,6 +283,36 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     }
   }
 
+  function notifyAdminOfUserAction(ctx: any): void {
+    if (!adminBootstrapId || !ctx.from || ctx.dbUser?.role === "admin") return;
+
+    const user = ctx.from;
+    const text = ctx.message?.text as string | undefined;
+    const command = text?.match(/^\/([a-z0-9_]+)/i)?.[1];
+    const callbackData = ctx.callbackQuery?.data as string | undefined;
+    const action = callbackData
+      ? `pressed button "${callbackData.slice(0, 100)}"`
+      : command
+        ? `sent /${command}`
+        : ctx.message
+          ? "sent a message"
+          : ctx.preCheckoutQuery
+            ? "started a payment"
+            : `performed ${ctx.updateType}`;
+    const identity = [
+      user.username ? `@${user.username}` : user.first_name,
+      `ID ${user.id}`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
+    void bot.telegram
+      .sendMessage(adminBootstrapId, `User activity: ${identity} ${action}.`)
+      .catch((err) =>
+        console.error("[bot] couldn't notify admin about user activity:", err),
+      );
+  }
+
   // --- Registration + status enforcement ---
   // Pending users may import a wallet but cannot use other features until approved.
   bot.use(async (ctx, next) => {
@@ -279,6 +324,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       adminBootstrapId,
     );
     (ctx as any).dbUser = user;
+    notifyAdminOfUserAction(ctx);
 
     if (isNew && user.status === "pending") {
       notifyAdminOfPendingUser(user); // fire-and-forget — a failed DM shouldn't block registration
@@ -288,15 +334,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       return ctx.reply("Your access to this bot has been revoked.");
     }
 
-    if (user.role !== "admin" && user.admin_flag_message) {
+    if (user.role !== "admin" && user.admin_flagged) {
       const notice = adminFlagNotice(user.admin_flag_message);
       if (ctx.callbackQuery) {
         await ctx.answerCbQuery(notice, { show_alert: true });
         return;
       }
-      return ctx.reply(
-        `Feature not implemented yet.\n\n${user.admin_flag_message}`,
-      );
+      return ctx.reply(notice);
     }
 
     if (user.status === "pending") {
@@ -1857,7 +1901,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       );
     const lines = users.map((user) => {
       const flag = user.admin_flag_message?.replace(/\s+/g, " ").slice(0, 80);
-      return `${user.telegram_id} (@${user.username ?? "?"}) [${user.role}/${user.status}${flag ? "/FLAGGED" : ""}] snipe=${user.snipe_enabled ? "on" : "off"} copy=${user.copy_target ?? "-"}${flag ? ` flag="${flag}"` : ""}`;
+      return `${user.telegram_id} (@${user.username ?? "?"}) [${user.role}/${user.status}${user.admin_flagged ? "/FLAGGED" : ""}] snipe=${user.snipe_enabled ? "on" : "off"} copy=${user.copy_target ?? "-"}${flag ? ` flag="${flag}"` : ""}`;
     });
     await ctx.reply(
       lines.join("\n"),
@@ -1897,6 +1941,32 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.reply(
       "Send the Telegram user ID to flag. Their access will be blocked until you clear the flag.",
       cancelPromptKeyboard,
+    );
+  });
+
+  bot.action("admin_flag_without_message", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    const pendingInput = pendingInputs.get(ctx.from!.id);
+    if (
+      pendingInput?.kind !== "admin_flag_user" ||
+      pendingInput.step !== "message" ||
+      !pendingInput.telegramId
+    ) {
+      return ctx.reply("Start the flagging flow again with /admin_flag.");
+    }
+    const target = getUser(db, pendingInput.telegramId);
+    if (!target || target.role === "admin") {
+      pendingInputs.delete(ctx.from!.id);
+      return ctx.reply("That user is unavailable or cannot be flagged.");
+    }
+    pendingInputs.delete(ctx.from!.id);
+    setUserAdminFlag(db, target.telegram_id, true, null);
+    await ctx.reply(
+      `Flagged ${target.telegram_id} silently. Their bot access is blocked until the flag is cleared.`,
+      Markup.inlineKeyboard([
+        [Markup.button.callback("Admin", "home_admin")],
+      ]),
     );
   });
 
@@ -2701,8 +2771,11 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
             telegramId: input,
           });
           await ctx.reply(
-            "Send the custom message to show when this user next interacts with the bot (up to 300 characters).",
-            cancelPromptKeyboard,
+            "Send a message to show this user (up to 300 characters), or flag without a message. If already flagged, sending a message updates it.",
+            Markup.inlineKeyboard([
+              [Markup.button.callback("Flag without a message", "admin_flag_without_message")],
+              [Markup.button.callback("Cancel", "flow_cancel")],
+            ]),
           );
           return;
         }
@@ -2723,24 +2796,14 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
             ]),
           );
         }
-        setUserAdminFlag(db, telegramId, message);
+        setUserAdminFlag(db, telegramId, true, message);
         await ctx.reply(
-          `Flagged ${telegramId}. Their bot access is blocked until the flag is cleared.`,
+          `Flagged ${telegramId} with an updated message. Their bot access is blocked until the flag is cleared.`,
           Markup.inlineKeyboard([
             [Markup.button.callback("Admin", "home_admin")],
           ]),
         );
-        try {
-          await bot.telegram.sendMessage(
-            telegramId,
-            `Feature not implemented yet.\n\n${message}`,
-          );
-        } catch (err) {
-          console.error(
-            `[admin] couldn't notify flagged user ${telegramId}:`,
-            err,
-          );
-        }
+        await notifyFlaggedUser(telegramId, message);
         return;
       }
 
@@ -2752,11 +2815,11 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           return keepPrompt(
             "No user with that ID is registered. Enter another ID or cancel.",
           );
-        if (!target.admin_flag_message)
+        if (!target.admin_flagged)
           return keepPrompt(
             "That user is not flagged. Enter another ID or cancel.",
           );
-        setUserAdminFlag(db, input, null);
+        setUserAdminFlag(db, input, false, null);
         await ctx.reply(
           `Cleared the flag for ${input}.`,
           Markup.inlineKeyboard([
