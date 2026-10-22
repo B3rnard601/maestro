@@ -15,6 +15,7 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       username TEXT,
       role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('user','admin')),
       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','active','banned')),
+      admin_flagged INTEGER NOT NULL DEFAULT 0,
       admin_flag_message TEXT,
       solana_address TEXT,
       evm_address TEXT,
@@ -280,6 +281,7 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
           username TEXT,
           role TEXT NOT NULL DEFAULT 'user' CHECK(role IN ('user','admin')),
           status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','active','banned')),
+          admin_flagged INTEGER NOT NULL DEFAULT 0,
           admin_flag_message TEXT,
           solana_address TEXT,
           evm_address TEXT,
@@ -338,7 +340,9 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
   ensureColumn("users", "max_daily_spend_eth_exact", "TEXT NOT NULL DEFAULT '0.5'");
   ensureColumn("users", "max_slippage_bps", "INTEGER NOT NULL DEFAULT 500");
   ensureColumn("users", "cooldown_seconds", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn("users", "admin_flagged", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn("users", "admin_flag_message", "TEXT");
+  db.exec(`UPDATE users SET admin_flagged = 1 WHERE admin_flag_message IS NOT NULL AND admin_flagged = 0`);
   ensureColumn("trade_lifecycle", "job_id", "TEXT");
   const legacyUsers = db.prepare(`SELECT telegram_id, snipe_size_sol, snipe_size_sol_exact, snipe_size_eth, snipe_size_eth_exact,
     copy_size_ratio, copy_size_ratio_exact, copy_max_amount, copy_max_amount_exact FROM users`).all() as Array<{
@@ -405,6 +409,7 @@ export interface UserRow {
   username: string | null;
   role: "user" | "admin";
   status: "pending" | "active" | "banned";
+  admin_flagged: number;
   admin_flag_message: string | null;
   solana_address: string | null;
   evm_address: string | null;
@@ -908,9 +913,15 @@ export function setUserStatus(db: Database.Database, telegramId: string, status:
   db.prepare(`UPDATE users SET status = ? WHERE telegram_id = ?`).run(status, telegramId);
 }
 
-export function setUserAdminFlag(db: Database.Database, telegramId: string, message: string | null): void {
-  const result = db.prepare(`UPDATE users SET admin_flag_message = ? WHERE telegram_id = ?`)
-    .run(message, telegramId);
+export function setUserAdminFlag(
+  db: Database.Database,
+  telegramId: string,
+  flagged: boolean,
+  message: string | null,
+): void {
+  const result = db.prepare(
+    `UPDATE users SET admin_flagged = ?, admin_flag_message = ? WHERE telegram_id = ?`,
+  ).run(flagged ? 1 : 0, message, telegramId);
   if (result.changes !== 1) throw new Error(`User ${telegramId} is missing.`);
 }
 
