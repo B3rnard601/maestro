@@ -1,4 +1,5 @@
 import type { Telegram } from "telegraf";
+import { styleBotResponse } from "./presentation.js";
 
 type PendingMessage = {
   chatId: string;
@@ -171,7 +172,7 @@ export function rateLimitTelegramMessages(
     const priority = String(chatId) === adminChatId ? "admin" : "user";
     return limiter.send(
       chatId,
-      () => sendMessage(chatId, text, extra),
+      () => sendMessage(chatId, styleBotResponse(text), extra),
       priority,
     );
   };

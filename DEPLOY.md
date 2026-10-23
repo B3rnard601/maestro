@@ -42,7 +42,14 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 npm run dev
 ```
 
-Message your bot on Telegram — you're auto-registered on first contact. If your id matches `TELEGRAM_OWNER_ID` you're promoted to admin and auto-approved. Other users remain pending and can only import a wallet and view onboarding/help until an admin approves them. An admin can approve only after at least one wallet has been imported. Every trading and account feature stays unavailable until both steps are complete; see the operational checklist below.
+Message your bot on Telegram — you're auto-registered on first contact. If your id matches `TELEGRAM_OWNER_ID` you're promoted to admin and auto-approved. Everyone sees the same welcome menu; pending users can import a wallet and view help, while account and trading actions stay unavailable until an admin approves them. An admin can approve only after at least one wallet has been imported; see the operational checklist below.
+
+### New menu features
+
+- **Presales:** admins manage the curated list with `/admin_presales`, `/admin_presale_add <solana|evm> <title> | <https://url> | <details>`, and `/admin_presale_remove <listing_id>`. Users browse with `/presales`. Listings are informational, not verified or endorsed by Maestro.
+- **Referrals:** `/referrals` creates a personal Telegram deep link and shows attributed new signups. Attribution is recorded once for new accounts only; there are no referral rewards or payouts.
+- **Bridge:** `/bridge` requests a quote-only Solana↔configured-EVM route from LI.FI. Both primary wallets must exist. LI.FI receives their public addresses; Maestro does not sign, construct a wallet transaction, or submit a transfer. Route availability depends on LI.FI and the configured EVM chain.
+- **Signals:** the menu opens existing premium price alerts; premium access is required to create or view alerts.
 
 From the Telegram Admin menu, admins can flag a non-admin user with a custom message or clear that flag later. A flagged user's callback/button interactions show the flag message in a Telegram popup; text commands/messages receive it as a chat reply. Flagging blocks access until the admin clears it. Telegram popups require a user interaction, so the bot also sends the user a notification when the flag is set.
 
