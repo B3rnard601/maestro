@@ -133,6 +133,25 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       triggered_at INTEGER
     );
 
+    CREATE TABLE IF NOT EXISTS presale_listings (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
+      url TEXT NOT NULL,
+      details TEXT NOT NULL,
+      created_by TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS referral_attributions (
+      referred_user_id TEXT PRIMARY KEY,
+      referrer_user_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      CHECK(referred_user_id <> referrer_user_id)
+    );
+    CREATE INDEX IF NOT EXISTS referral_attributions_referrer
+      ON referral_attributions(referrer_user_id, created_at);
+
     CREATE TABLE IF NOT EXISTS wallet_funding_state (
       wallet_id TEXT PRIMARY KEY,
       chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
@@ -1435,4 +1454,136 @@ export function getHoldings(db: Database.Database, chain: "solana" | "evm", user
     .prepare(`SELECT identifier FROM holdings WHERE chain = ? AND user_id = ?`)
     .all(chain, userId)
     .map((r: any) => r.identifier);
+}
+
+export interface PresaleListingRow {
+  id: string;
+  title: string;
+  chain: "solana" | "evm";
+  url: string;
+  details: string;
+  created_by: string;
+  created_at: number;
+}
+
+export function addPresaleListing(
+  db: Database.Database,
+  listing: Omit<PresaleListingRow, "created_at">,
+): void {
+  const title = listing.title.trim();
+  const details = listing.details.trim();
+  let url: URL;
+  try {
+    url = new URL(listing.url);
+  } catch {
+    throw new Error("Presale URL must be a valid HTTP or HTTPS link.");
+  }
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("Presale URL must use HTTP or HTTPS.");
+  }
+  if (!title || title.length > 80) {
+    throw new Error("Presale title must be between 1 and 80 characters.");
+  }
+  if (!details || details.length > 500) {
+    throw new Error("Presale details must be between 1 and 500 characters.");
+  }
+  if (url.toString().length > 500) {
+    throw new Error("Presale URL must not exceed 500 characters.");
+  }
+  db.prepare(
+    `INSERT INTO presale_listings
+      (id, title, chain, url, details, created_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    listing.id,
+    title,
+    listing.chain,
+    url.toString(),
+    details,
+    listing.created_by,
+    Date.now(),
+  );
+}
+
+export function listPresaleListings(
+  db: Database.Database,
+  limit = 30,
+  offset = 0,
+): PresaleListingRow[] {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    throw new RangeError("Presale listing limit must be from 1 to 100.");
+  }
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new RangeError("Presale listing offset must be a non-negative integer.");
+  }
+  return db
+    .prepare(
+      `SELECT * FROM presale_listings
+       ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+    )
+    .all(limit, offset) as PresaleListingRow[];
+}
+
+export function countPresaleListings(db: Database.Database): number {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS count FROM presale_listings`)
+    .get() as { count: number };
+  return row.count;
+}
+
+export function removePresaleListing(
+  db: Database.Database,
+  id: string,
+): boolean {
+  return (
+    db.prepare(`DELETE FROM presale_listings WHERE id = ?`).run(id).changes > 0
+  );
+}
+
+export function recordReferralAttribution(
+  db: Database.Database,
+  referrerUserId: string,
+  referredUserId: string,
+): boolean {
+  if (
+    !/^\d+$/.test(referrerUserId) ||
+    !/^\d+$/.test(referredUserId) ||
+    referrerUserId === referredUserId
+  ) {
+    return false;
+  }
+  const result = db
+    .prepare(
+      `INSERT OR IGNORE INTO referral_attributions
+        (referred_user_id, referrer_user_id, created_at)
+       SELECT ?, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM users
+         WHERE telegram_id = ? AND status = 'active' AND admin_flagged = 0
+       )
+       AND EXISTS (
+         SELECT 1 FROM users WHERE telegram_id = ?
+       )`,
+    )
+    .run(
+      referredUserId,
+      referrerUserId,
+      Date.now(),
+      referrerUserId,
+      referredUserId,
+    );
+  return result.changes === 1;
+}
+
+export function countReferrals(
+  db: Database.Database,
+  referrerUserId: string,
+): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM referral_attributions
+       WHERE referrer_user_id = ?`,
+    )
+    .get(referrerUserId) as { count: number };
+  return row.count;
 }

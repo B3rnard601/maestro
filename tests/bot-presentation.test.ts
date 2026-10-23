@@ -1,11 +1,63 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { FmtString } from "telegraf/format";
 import {
+  styleBotResponse,
+  startWelcome,
   tradingHeading,
   tradingSide,
   tradingStatus,
   triggerDirection,
 } from "../src/bot/presentation.js";
+
+test("plain bot replies receive a visual marker without duplicating existing styling", () => {
+  assert.equal(styleBotResponse("Wallet imported."), "✦ Wallet imported.");
+  assert.equal(
+    styleBotResponse("✨ Wallet imported."),
+    "✨ Wallet imported.",
+  );
+  assert.equal(styleBotResponse("  Wallet imported."), "✦   Wallet imported.");
+});
+
+test("callback response styling respects Telegram's text limit", () => {
+  const styled = styleBotResponse("Access denied.".repeat(30), 200);
+  assert.equal(Array.from(styled).length, 200);
+  assert.ok(styled.startsWith("✦ "));
+});
+
+test("response styling preserves formatted text entities", () => {
+  const styled = styleBotResponse(
+    new FmtString("Wallet", [{ type: "bold", offset: 0, length: 6 }]),
+  );
+  assert.equal(styled.text, "✦ Wallet");
+  assert.deepEqual(styled.entities, [
+    { type: "bold", offset: 2, length: 6 },
+  ]);
+});
+
+test("start welcome stays consistent while explaining account access", () => {
+  const activeWelcome = startWelcome("justincallz", false);
+  const pendingWelcome = startWelcome("justincallz", true);
+
+  assert.equal(
+    activeWelcome.split("\n").slice(0, -1).join("\n"),
+    pendingWelcome.split("\n").slice(0, -1).join("\n"),
+  );
+  assert.match(activeWelcome, /✨ Welcome, justincallz, to Maestro/);
+  assert.match(activeWelcome, /curated presales/);
+  assert.match(activeWelcome, /quote-only bridge route/);
+  assert.match(activeWelcome, /BUY & SELL NOW/);
+  assert.match(activeWelcome, /Choose a section below to get started\./);
+  assert.match(pendingWelcome, /✨ Welcome, justincallz, to Maestro/);
+  assert.match(
+    pendingWelcome,
+    /Import a wallet and wait for admin approval/,
+  );
+  assert.equal(
+    startWelcome("  ", false).startsWith("✨ Welcome, trader, to Maestro"),
+    true,
+  );
+});
 
 test("trading headings use a consistent uppercase section treatment", () => {
   assert.equal(

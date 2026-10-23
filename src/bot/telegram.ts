@@ -71,6 +71,12 @@ import {
   listRecentTradesForUser,
   listRecentTradeJobsForUser,
   listPremiumPriceAlerts,
+  addPresaleListing,
+  countPresaleListings,
+  countReferrals,
+  listPresaleListings,
+  recordReferralAttribution,
+  removePresaleListing,
 } from "../db/db.js";
 import {
   executeBuy as executeSolanaBuy,
@@ -87,11 +93,14 @@ import {
 import { assertBuyEntryEnabled, evaluateTradePolicy } from "../risk/policy.js";
 import { formatUnitsExact } from "../shared/amount.js";
 import {
+  styleBotResponse,
+  startWelcome,
   tradingHeading,
   tradingSide,
   tradingStatus,
   triggerDirection,
 } from "./presentation.js";
+import { getNativeBridgeQuote } from "../bridge/lifi.js";
 import type { Wallet as EvmWallet } from "ethers";
 import { beginTrackedTrade } from "../transactions/tracker.js";
 import {
@@ -105,6 +114,9 @@ const USER_COMMANDS = [
   { command: "wallets", description: "Manage or import wallets" },
   { command: "cancel_import", description: "Cancel wallet import" },
   { command: "portfolio", description: "View portfolio balances" },
+  { command: "presales", description: "Browse curated presale listings" },
+  { command: "referrals", description: "Get your referral link and stats" },
+  { command: "bridge", description: "Get a quote-only cross-chain route" },
   { command: "premium", description: "View or subscribe to premium" },
   { command: "premium_report", description: "View premium realized P&L" },
   { command: "premium_alert", description: "Create a premium price alert" },
@@ -134,6 +146,9 @@ const ADMIN_COMMANDS = [
   { command: "admin_premium_price", description: "Set the monthly premium price in Stars" },
   { command: "admin_premium_grant", description: "Grant premium to a user for a number of days" },
   { command: "admin_premium_revoke", description: "Terminate a user's premium access" },
+  { command: "admin_presales", description: "List curated presale entries" },
+  { command: "admin_presale_add", description: "Add a curated presale entry" },
+  { command: "admin_presale_remove", description: "Remove a presale entry" },
 ];
 
 export async function configureBotCommands(
@@ -166,29 +181,37 @@ export interface BotDeps {
   >;
 }
 
-const HELP_TEXT = `maestro
+const HELP_TEXT = `✨ MAESTRO
 
-Use the buttons below to manage wallets, portfolio, auto-buy, copy trading, and limit orders. When an action needs an address or amount, the bot will prompt you for it.`;
-
-const HOME_TEXT = `${tradingHeading("◆", "Maestro · on-chain trading")}\nYour self-custody trading desk.\n\nChoose a section below to manage wallets, view balances, and control trading.`;
+Use the buttons below to manage wallets, portfolio, auto-buy, copy trading, limit orders, curated presales, referrals, and quote-only bridge routes. Signals open premium price alerts. When an action needs an address or amount, the bot will prompt you for it.`;
 
 function homeKeyboard(isAdmin: boolean) {
   const rows = [
     [
+      Markup.button.callback("🔗 Chains", "home_chains"),
       Markup.button.callback("💼 Wallets", "home_wallets"),
-      Markup.button.callback("📊 Portfolio", "wallets_portfolio"),
     ],
-    [Markup.button.callback("⚡ Trade", "home_trade")],
     [
-      Markup.button.callback("🎯 Auto-buy", "home_snipe"),
-      Markup.button.callback("🔁 Copy trading", "home_copytrade"),
+      Markup.button.callback("⚙️ Global Settings", "home_risk_settings"),
+      Markup.button.callback("📡 Signals", "home_signals"),
     ],
-    [Markup.button.callback("⚙️ Trading settings", "home_risk_settings")],
-    [Markup.button.callback("⭐ Premium", "home_premium")],
     [
-      Markup.button.callback("📈 Orders", "home_orders"),
-      Markup.button.callback("🧾 Recent trades", "home_trades"),
+      Markup.button.callback("🤖 Copytrade", "home_copytrade"),
+      Markup.button.callback("🔔 Presales", "home_presales"),
     ],
+    [
+      Markup.button.callback("🎯 Auto Snipe", "home_snipe"),
+      Markup.button.callback("🕒 Active Orders", "home_orders"),
+    ],
+    [
+      Markup.button.callback("📈 Positions", "wallets_portfolio"),
+      Markup.button.callback("⭐ Premium", "home_premium"),
+    ],
+    [
+      Markup.button.callback("🤝 Referral", "home_referrals"),
+      Markup.button.callback("🌉 Bridge", "home_bridge"),
+    ],
+    [Markup.button.callback("⚡ BUY & SELL NOW", "home_trade")],
     [Markup.button.callback("❔ Help", "home_help")],
   ];
   if (isAdmin) rows.push([Markup.button.callback("🛡 Admin", "home_admin")]);
@@ -384,7 +407,24 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   // --- Registration + status enforcement ---
   // Pending users may import a wallet but cannot use other features until approved.
   bot.use(async (ctx, next) => {
-    rateLimitTelegramMessages(ctx.telegram, messageLimiter, adminBootstrapId);
+    const answerCallback = ctx.answerCbQuery.bind(ctx);
+    ctx.answerCbQuery = (text?: string, extra?: object) =>
+      answerCallback(
+        typeof text === "string" ? styleBotResponse(text, 200) : text,
+        extra,
+      );
+    const answerPreCheckout = ctx.answerPreCheckoutQuery.bind(ctx);
+    ctx.answerPreCheckoutQuery = (
+      ok: boolean,
+      errorMessage?: string,
+    ) =>
+      answerPreCheckout(
+        ok,
+        typeof errorMessage === "string"
+          ? styleBotResponse(errorMessage, 200)
+          : errorMessage,
+      );
+
     if (!ctx.from) return next();
     const { user, isNew } = getOrCreateUser(
       db,
@@ -392,6 +432,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       ctx.from.username,
       adminBootstrapId,
     );
+    const startText = (ctx.message as any)?.text as string | undefined;
+    const referrerId = startText?.match(
+      /^\/start(?:@\w+)?\s+ref_(\d+)(?:\s|$)/,
+    )?.[1];
+    if (isNew && referrerId) {
+      recordReferralAttribution(db, referrerId, user.telegram_id);
+    }
     (ctx as any).dbUser = user;
     notifyAdminOfUserAction(ctx);
 
@@ -437,13 +484,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       if (!isOnboardingCommand && !isOnboardingAction && !isImportText) {
         if (ctx.callbackQuery) {
           await ctx.answerCbQuery(
-            "Feature not implemented yet. Import a wallet.",
+            "Import a wallet and wait for admin approval to unlock this feature.",
             { show_alert: true },
           );
           return;
         }
         return ctx.reply(
-          "Feature not implemented yet. Import a wallet.",
+          "Import a wallet and wait for admin approval to unlock this feature.",
         );
       }
     }
@@ -491,6 +538,11 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   };
   type PendingInput =
     | { kind: "snipe_size"; chain: "solana" | "evm" }
+    | {
+        kind: "bridge_amount";
+        fromChain: "solana" | "evm";
+        toChain: "solana" | "evm";
+      }
     | {
         kind: "risk_setting";
         field:
@@ -803,16 +855,156 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   async function showStartScreen(ctx: any) {
     const user = ctx.dbUser;
-    if (user?.status === "pending") {
-      const hasWallet = listWalletsFor(db, String(ctx.from!.id)).length > 0;
-      return ctx.reply(
-        hasWallet
-          ? "Your wallet is imported. Your account is waiting for admin approval; Features not implemented yet."
-          : "Welcome to Maestro. Import a wallet to request admin approval. Features not implemented yet.",
-        onboardingKeyboard(),
+    return ctx.reply(
+      startWelcome(ctx.from?.first_name ?? "", user?.status === "pending"),
+      homeKeyboard(user?.role === "admin"),
+    );
+  }
+
+  async function showPresales(
+    ctx: any,
+    adminView = false,
+    offset = 0,
+  ): Promise<void> {
+    const pageSize = adminView ? 10 : 3;
+    const listings = listPresaleListings(db, pageSize, offset);
+    const total = countPresaleListings(db);
+    if (listings.length === 0) {
+      await ctx.reply(
+        adminView
+          ? `${tradingHeading("🔔", "Presale management")}\nNo listings yet.\n\nAdd one with:\n/admin_presale_add <solana|evm> <title> | <https://url> | <details>`
+          : `${tradingHeading("🔔", "Presales")}\nNo curated listings are available right now.\n\nListings are informational only. Verify every project and link independently before interacting.`,
+        Markup.inlineKeyboard([
+          [
+            Markup.button.callback(
+              adminView ? "↩️ Admin" : "↩️ Home",
+              adminView ? "home_admin" : "home",
+            ),
+          ],
+        ]),
+      );
+      return;
+    }
+    const lines = [
+      tradingHeading("🔔", adminView ? "Presale management" : "Presales"),
+      `📄 Listings ${offset + 1}–${offset + listings.length} of ${total}`,
+      adminView
+        ? "Remove a listing with /admin_presale_remove <id>."
+        : "Community listings · informational only · verify independently",
+      "",
+      ...listings.map((listing) =>
+        adminView
+          ? `${listing.id} · ${listing.chain.toUpperCase()} · ${listing.title}`
+          : `🔹 ${listing.title} · ${listing.chain.toUpperCase()}\n${listing.details}\n${listing.url}`,
+      ),
+    ];
+    if (!adminView) {
+      lines.push(
+        "",
+        "⚠️ Maestro does not verify, endorse, or guarantee any listed project.",
       );
     }
-    return ctx.reply(HOME_TEXT, homeKeyboard(user?.role === "admin"));
+    await ctx.reply(
+      lines.join("\n"),
+      Markup.inlineKeyboard([
+        [
+          ...(offset > 0
+            ? [
+                Markup.button.callback(
+                  "⬅️ Previous",
+                  `${adminView ? "admin" : "user"}_presales_page_${offset - pageSize}`,
+                ),
+              ]
+            : []),
+          ...(offset + pageSize < total
+            ? [
+                Markup.button.callback(
+                  "➡️ Next",
+                  `${adminView ? "admin" : "user"}_presales_page_${offset + pageSize}`,
+                ),
+              ]
+            : []),
+        ],
+        [
+          Markup.button.callback(
+            adminView ? "↩️ Admin" : "↩️ Home",
+            adminView ? "home_admin" : "home",
+          ),
+        ],
+      ]),
+    );
+  }
+
+  async function showReferrals(ctx: any): Promise<void> {
+    let botInfo;
+    try {
+      botInfo = await ctx.telegram.getMe();
+    } catch (error) {
+      console.error("[referrals] couldn't retrieve the bot username:", error);
+      await ctx.reply(
+        "Couldn't create your invite link right now. Please try again later.",
+      );
+      return;
+    }
+    if (!botInfo.username) {
+      await ctx.reply(
+        "This bot has no public username, so referral links are unavailable.",
+      );
+      return;
+    }
+    const userId = String(ctx.from!.id);
+    const inviteLink = `https://t.me/${botInfo.username}?start=ref_${userId}`;
+    const referrals = countReferrals(db, userId);
+    await ctx.reply(
+      `${tradingHeading("🤝", "Referral program")}\nYour personal invite link:\n${inviteLink}\n\n👥 Referred signups: ${referrals}\n\nAttribution is recorded when a new user opens your link. This program currently tracks signups only; it does not pay rewards.`,
+      Markup.inlineKeyboard([[Markup.button.callback("↩️ Home", "home")]]),
+    );
+  }
+
+  async function showBridgeMenu(ctx: any): Promise<void> {
+    await ctx.reply(
+      `${tradingHeading("🌉", "Bridge quotes")}\nGet a live native-token route quote between Solana and your configured EVM network.\n\n🔒 Quote only: Maestro will not sign or submit a transfer.\n🔐 LI.FI receives your public wallet addresses to calculate a quote.`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("◎ Solana → EVM", "bridge_solana_evm"),
+          Markup.button.callback("Ξ EVM → Solana", "bridge_evm_solana"),
+        ],
+        [Markup.button.callback("↩️ Home", "home")],
+      ]),
+    );
+  }
+
+  async function beginBridgeQuote(
+    ctx: any,
+    fromChain: "solana" | "evm",
+    toChain: "solana" | "evm",
+  ): Promise<void> {
+    if (fromChain === toChain) {
+      await ctx.reply("Choose two different networks for a bridge quote.");
+      return;
+    }
+    const userId = String(ctx.from!.id);
+    const sourceWallet = getPrimaryWallet(db, userId, fromChain);
+    const destinationWallet = getPrimaryWallet(db, userId, toChain);
+    if (!sourceWallet || !destinationWallet) {
+      await ctx.reply(
+        `A primary ${fromChain === "solana" ? "Solana" : "EVM"} wallet and a primary ${toChain === "solana" ? "Solana" : "EVM"} wallet are required for a route quote.`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("💼 Manage wallets", "home_wallets")],
+          [Markup.button.callback("↩️ Home", "home")],
+        ]),
+      );
+      return;
+    }
+    pendingInputs.set(ctx.from!.id, {
+      kind: "bridge_amount",
+      fromChain,
+      toChain,
+    });
+    await ctx.reply(
+      `Enter the amount of native ${fromChain === "solana" ? "SOL" : "ETH"} to quote.\n\nNo transfer will be signed or submitted. LI.FI receives both public wallet addresses.`,
+      cancelPromptKeyboard,
+    );
   }
 
   bot.start(showStartScreen);
@@ -829,7 +1021,55 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     const user = (ctx as any).dbUser;
     if (user?.status === "pending") return showStartScreen(ctx);
-    await ctx.reply(HOME_TEXT, homeKeyboard(user?.role === "admin"));
+    await ctx.reply(
+      startWelcome(ctx.from?.first_name ?? "", false),
+      homeKeyboard(user?.role === "admin"),
+    );
+  });
+
+  bot.action("home_chains", async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      "Choose a chain to manage its wallets. You can also buy or sell on either supported chain.",
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("◎ Solana wallets", "wchain_solana"),
+          Markup.button.callback("Ξ EVM wallets", "wchain_evm"),
+        ],
+        [Markup.button.callback("⚡ Buy & sell", "home_trade")],
+        [Markup.button.callback("↩️ Home", "home")],
+      ]),
+    );
+  });
+
+  bot.command("presales", (ctx) => showPresales(ctx));
+  bot.action("home_presales", async (ctx) => {
+    await ctx.answerCbQuery();
+    await showPresales(ctx);
+  });
+  bot.action(/^user_presales_page_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    await showPresales(ctx, false, Number(ctx.match[1]));
+  });
+
+  bot.command("referrals", (ctx) => showReferrals(ctx));
+  bot.action("home_referrals", async (ctx) => {
+    await ctx.answerCbQuery();
+    await showReferrals(ctx);
+  });
+
+  bot.command("bridge", (ctx) => showBridgeMenu(ctx));
+  bot.action("home_bridge", async (ctx) => {
+    await ctx.answerCbQuery();
+    await showBridgeMenu(ctx);
+  });
+  bot.action(/^bridge_(solana|evm)_(solana|evm)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    await beginBridgeQuote(
+      ctx,
+      ctx.match[1] as "solana" | "evm",
+      ctx.match[2] as "solana" | "evm",
+    );
   });
 
   bot.action("home_wallets", async (ctx) => {
@@ -1250,6 +1490,10 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   }
   bot.command("premium_alerts", (ctx) => sendPremiumAlerts(ctx));
   bot.action("premium_alerts", async (ctx) => {
+    await ctx.answerCbQuery();
+    await sendPremiumAlerts(ctx);
+  });
+  bot.action("home_signals", async (ctx) => {
     await ctx.answerCbQuery();
     await sendPremiumAlerts(ctx);
   });
@@ -1807,9 +2051,21 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           ),
         ],
         [Markup.button.callback("🧾 Recent risk audit", "home_admin_audit")],
+        [Markup.button.callback("🔔 Manage presales", "home_admin_presales")],
         [Markup.button.callback("↩️ Home", "home")],
       ]),
     );
+  });
+
+  bot.action("home_admin_presales", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    await showPresales(ctx, true);
+  });
+  bot.action(/^admin_presales_page_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    await showPresales(ctx, true, Number(ctx.match[1]));
   });
 
   bot.action("home_admin_kill_switch", async (ctx) => {
@@ -2308,6 +2564,62 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         pendingInputs.set(ctx.from!.id, pendingInput);
         await ctx.reply(prompt, cancelPromptKeyboard);
       };
+
+      if (pendingInput.kind === "bridge_amount") {
+        const decimals = pendingInput.fromChain === "solana" ? 9 : 18;
+        if (!isPositiveDecimal(input, decimals)) {
+          return keepPrompt(
+            `Enter a positive native-token amount with at most ${decimals} decimal places.`,
+          );
+        }
+        const userId = String(ctx.from!.id);
+        const sourceWallet = getPrimaryWallet(
+          db,
+          userId,
+          pendingInput.fromChain,
+        );
+        const destinationWallet = getPrimaryWallet(
+          db,
+          userId,
+          pendingInput.toChain,
+        );
+        if (!sourceWallet || !destinationWallet) {
+          await ctx.reply(
+            "Both primary wallets are required. Manage your wallets, then request a new quote.",
+            Markup.inlineKeyboard([
+              [Markup.button.callback("💼 Manage wallets", "home_wallets")],
+              [Markup.button.callback("↩️ Home", "home")],
+            ]),
+          );
+          return;
+        }
+        try {
+          const evmNetwork = await evmProvider.getNetwork();
+          const quote = await getNativeBridgeQuote({
+            fromChain: pendingInput.fromChain,
+            toChain: pendingInput.toChain,
+            amount: input,
+            fromAddress: sourceWallet.address,
+            toAddress: destinationWallet.address,
+            evmChainId: Number(evmNetwork.chainId),
+          });
+          await ctx.reply(
+            `${tradingHeading("🧾", "Route quote")}\n📤 ${quote.fromAmount} ${quote.fromSymbol} · ${quote.fromChain}\n📥 Est. ${quote.toAmount} ${quote.toSymbol} · ${quote.toChain}\n🛡 Minimum estimate: ${quote.minimumToAmount} ${quote.toSymbol}\n🧰 Route: ${quote.provider}${quote.estimatedSeconds ? `\n⏱ Est. time: ${Math.ceil(quote.estimatedSeconds / 60)} min` : ""}\n\n⚠️ Quote only — no transaction has been created, signed, or submitted. Quotes can change; verify details with LI.FI before acting.`,
+            Markup.inlineKeyboard([
+              [
+                Markup.button.callback("🔄 New bridge quote", "home_bridge"),
+                Markup.button.callback("↩️ Home", "home"),
+              ],
+            ]),
+          );
+        } catch (error) {
+          console.error(`[bridge] quote failed for user ${userId}:`, error);
+          return keepPrompt(
+            `Couldn't get a bridge quote: ${error instanceof Error ? error.message : String(error)}\n\nCheck the amount and try again.`,
+          );
+        }
+        return;
+      }
 
       if (pendingInput.kind === "risk_setting") {
         const { field } = pendingInput;
@@ -3432,6 +3744,61 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   });
 
   // --- Admin commands ---
+  bot.command("admin_presales", async (ctx) => {
+    if (!requireAdmin(ctx)) return;
+    await showPresales(ctx, true);
+  });
+
+  bot.command("admin_presale_add", async (ctx) => {
+    if (!requireAdmin(ctx)) return;
+    const payload = ctx.message.text.replace(
+      /^\/admin_presale_add(?:@\S+)?\s*/i,
+      "",
+    );
+    const match = payload.match(
+      /^(solana|evm)\s+([^|]+)\|\s*(https?:\/\/\S+)\s*\|\s*([\s\S]+)$/i,
+    );
+    if (!match) {
+      return ctx.reply(
+        "Usage: /admin_presale_add <solana|evm> <title> | <https://url> | <details>",
+      );
+    }
+    const [, chainInput, title, url, details] = match;
+    try {
+      addPresaleListing(db, {
+        id: randomUUID(),
+        title,
+        chain: chainInput.toLowerCase() as "solana" | "evm",
+        url,
+        details,
+        created_by: String(ctx.from!.id),
+      });
+      await ctx.reply(
+        "✅ Presale listing added.",
+        Markup.inlineKeyboard([
+          [Markup.button.callback("🔔 View listings", "home_admin_presales")],
+          [Markup.button.callback("↩️ Admin", "home_admin")],
+        ]),
+      );
+    } catch (error) {
+      await ctx.reply(
+        `Couldn't add listing: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  });
+
+  bot.command("admin_presale_remove", (ctx) => {
+    if (!requireAdmin(ctx)) return;
+    const [, id] = ctx.message.text.trim().split(/\s+/);
+    if (!id) {
+      return ctx.reply("Usage: /admin_presale_remove <listing_id>");
+    }
+    if (!removePresaleListing(db, id)) {
+      return ctx.reply("No presale listing found with that ID.");
+    }
+    return ctx.reply("✅ Presale listing removed.");
+  });
+
   bot.command("admin_pending", (ctx) => {
     if (!requireAdmin(ctx)) return;
     const pending = listPendingUsers(db);
