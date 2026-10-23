@@ -94,6 +94,10 @@ import {
 } from "./presentation.js";
 import type { Wallet as EvmWallet } from "ethers";
 import { beginTrackedTrade } from "../transactions/tracker.js";
+import {
+  rateLimitTelegramMessages,
+  TelegramMessageLimiter,
+} from "./telegram-message-limiter.js";
 
 const USER_COMMANDS = [
   { command: "start", description: "Open the Maestro menu" },
@@ -228,14 +232,93 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     tradingLimits,
   } = deps;
   const bot = new Telegraf(token);
+  const adminBootstrapId = deps.adminBootstrapId;
+  const messageLimiter = new TelegramMessageLimiter();
+  rateLimitTelegramMessages(bot.telegram, messageLimiter, adminBootstrapId);
   bot.catch((err, ctx) => {
     console.error(
       `[bot] update ${ctx.update.update_id} (${ctx.updateType}) failed:`,
       err,
     );
   });
-  const adminBootstrapId = deps.adminBootstrapId;
   const pendingImport = new Map<number, PendingImport>();
+  const pendingAdminActivity = new Map<string, number>();
+  const pendingAdminRegistrations = new Map<string, string | null>();
+  let adminActivityFlushTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function flushAdminActivity(): void {
+    adminActivityFlushTimer = undefined;
+    if (
+      !adminBootstrapId ||
+      (pendingAdminActivity.size === 0 && pendingAdminRegistrations.size === 0)
+    ) {
+      return;
+    }
+
+    const totalUpdates = [...pendingAdminActivity.values()].reduce(
+      (sum, count) => sum + count,
+      0,
+    );
+    const lines: string[] = [];
+    if (pendingAdminActivity.size > 0) {
+      lines.push(
+        `User activity (${totalUpdates} update${totalUpdates === 1 ? "" : "s"}):`,
+      );
+      for (const [activity, count] of pendingAdminActivity) {
+        lines.push(`- ${activity}${count > 1 ? ` (${count} updates)` : ""}`);
+      }
+    }
+    if (pendingAdminRegistrations.size > 0) {
+      lines.push(`New users (${pendingAdminRegistrations.size}):`);
+      for (const [telegramId, username] of pendingAdminRegistrations) {
+        lines.push(
+          `- ${telegramId}${username ? ` (@${username})` : ""} — waiting for wallet import and admin approval`,
+        );
+      }
+    }
+    const messageLines: string[] = [];
+    let messageLength = 0;
+    for (const line of lines) {
+      if (messageLength + line.length + 1 > 3800) break;
+      messageLines.push(line);
+      messageLength += line.length + 1;
+    }
+    const omittedLines = lines.length - messageLines.length;
+    if (omittedLines > 0) {
+      messageLines.push(`... ${omittedLines} additional entries omitted.`);
+    }
+    pendingAdminActivity.clear();
+    pendingAdminRegistrations.clear();
+    void bot.telegram
+      .sendMessage(adminBootstrapId, messageLines.join("\n"))
+      .catch((err) =>
+        console.error("[bot] couldn't notify admin about user activity:", err),
+      );
+  }
+
+  function scheduleAdminActivityFlush(): void {
+    if (!adminActivityFlushTimer) {
+      adminActivityFlushTimer = setTimeout(flushAdminActivity, 1000);
+    }
+  }
+
+  function notifyAdminOfPendingUser(user: {
+    telegram_id: string;
+    username: string | null;
+  }): void {
+    if (!adminBootstrapId) return;
+    pendingAdminRegistrations.set(user.telegram_id, user.username);
+    scheduleAdminActivityFlush();
+  }
+
+  function addAdminActivity(activity: string): void {
+    pendingAdminActivity.set(
+      activity,
+      (pendingAdminActivity.get(activity) ?? 0) + 1,
+    );
+    scheduleAdminActivityFlush();
+  }
+
   startPremiumAlertWatcher({
     db,
     solConnection,
@@ -273,22 +356,6 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     }
   }
 
-  async function notifyAdminOfPendingUser(user: {
-    telegram_id: string;
-    username: string | null;
-  }): Promise<void> {
-    if (!adminBootstrapId) return;
-    try {
-      await bot.telegram.sendMessage(
-        adminBootstrapId,
-        `New user registered: ${user.telegram_id}${user.username ? ` (@${user.username})` : ""}. They must import a wallet before they can be approved.`,
-      );
-    } catch (err) {
-      // Admin may not have started a DM with the bot yet, or blocked it — not fatal, they can still /admin_pending.
-      console.error("[bot] couldn't DM admin about new pending user:", err);
-    }
-  }
-
   function notifyAdminOfUserAction(ctx: any): void {
     if (!adminBootstrapId || !ctx.from || ctx.dbUser?.role === "admin") return;
 
@@ -311,17 +378,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     ]
       .filter(Boolean)
       .join(" · ");
-
-    void bot.telegram
-      .sendMessage(adminBootstrapId, `User activity: ${identity} ${action}.`)
-      .catch((err) =>
-        console.error("[bot] couldn't notify admin about user activity:", err),
-      );
+    addAdminActivity(`${identity} ${action}.`);
   }
 
   // --- Registration + status enforcement ---
   // Pending users may import a wallet but cannot use other features until approved.
   bot.use(async (ctx, next) => {
+    rateLimitTelegramMessages(ctx.telegram, messageLimiter, adminBootstrapId);
     if (!ctx.from) return next();
     const { user, isNew } = getOrCreateUser(
       db,
