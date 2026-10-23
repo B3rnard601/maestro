@@ -13,5 +13,9 @@
     "dotenv": "^16.4.5",
     "@solana/web3.js": "^1.95.3",
     "ethers": "^6.13.4"
+  },
+  "overrides": {
+    "follow-redirects": "^1.16.1",
+    "jayson": "^5.0.0"
   }
 }
