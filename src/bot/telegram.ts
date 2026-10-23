@@ -228,6 +228,12 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     tradingLimits,
   } = deps;
   const bot = new Telegraf(token);
+  bot.catch((err, ctx) => {
+    console.error(
+      `[bot] update ${ctx.update.update_id} (${ctx.updateType}) failed:`,
+      err,
+    );
+  });
   const adminBootstrapId = deps.adminBootstrapId;
   const pendingImport = new Map<number, PendingImport>();
   startPremiumAlertWatcher({
