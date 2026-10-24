@@ -67,6 +67,12 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
         source: job.source,
         jobId: job.id,
       });
+      const slippageBps = job.requested_slippage_bps === null
+        ? decision.maxSlippageBps
+        : Math.min(job.requested_slippage_bps, decision.maxSlippageBps);
+      const antiMevEnabled = job.anti_mev_enabled === null
+        ? true
+        : job.anti_mev_enabled === 1;
       if (!decision.allowed) {
         if (decision.reasons.length === 1 && decision.reasons[0] === "KILL_SWITCH_ENABLED") {
           deferTradeJob(db, job.id, Date.now() + PAUSE_RECHECK_MS, "Buy entries paused by the admin kill switch.");
@@ -113,14 +119,16 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
               wallet: solWallet!,
               poolId: job.pool_ref,
               amountInLamports: parseUnitsExact(job.amount, 9),
-              slippageBps: decision.maxSlippageBps,
+              slippageBps,
+              useJitoBundle: antiMevEnabled,
+              jitoTipLamports: job.tip_lamports ?? 100_000,
               assertCanSubmit: () => {
                 const latest = evaluateTradePolicy(db, config, {
                   userId: job.user_id, chain: job.chain, side: "buy", amount: job.amount,
                   source: job.source, jobId: job.id,
                 });
                 if (!latest.allowed) throw new Error(`Risk policy changed before submission: ${latest.reasons.join(", ")}.`);
-                if (latest.maxSlippageBps < decision.maxSlippageBps) throw new Error("Slippage ceiling changed before submission; retry the trade.");
+                if (latest.maxSlippageBps < slippageBps) throw new Error("Slippage ceiling changed before submission; retry the trade.");
                 assertBuyEntryEnabled(db, job.user_id, "solana", job.source);
               },
               onLifecycleEvent: observe,
@@ -132,7 +140,7 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
               wallet: solWallet!,
               poolId: job.pool_ref,
               amountInTokenBaseUnits: parseUnitsExact(job.amount, job.decimals),
-              slippageBps: decision.maxSlippageBps,
+              slippageBps,
               assertCanSubmit: () => {
                 const latest = evaluateTradePolicy(db, config, {
                   userId: job.user_id, chain: job.chain, side: "sell", amount: job.amount, source: job.source,
@@ -148,14 +156,15 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
             wallet: evmWallet!,
             tokenAddress: job.asset,
             amountInEth: job.amount,
-            slippageBps: decision.maxSlippageBps,
+            slippageBps,
+            usePrivateRelay: antiMevEnabled,
             assertCanSubmit: () => {
               const latest = evaluateTradePolicy(db, config, {
                 userId: job.user_id, chain: job.chain, side: "buy", amount: job.amount,
                 source: job.source, jobId: job.id,
               });
               if (!latest.allowed) throw new Error(`Risk policy changed before submission: ${latest.reasons.join(", ")}.`);
-              if (latest.maxSlippageBps < decision.maxSlippageBps) throw new Error("Slippage ceiling changed before submission; retry the trade.");
+              if (latest.maxSlippageBps < slippageBps) throw new Error("Slippage ceiling changed before submission; retry the trade.");
               assertBuyEntryEnabled(db, job.user_id, "evm", job.source);
             },
             onLifecycleEvent: observe,
@@ -168,7 +177,7 @@ export function startTradeWorker(deps: TradeWorkerDeps): () => void {
             wallet: evmWallet!,
             tokenAddress: job.asset,
             amountInTokenBaseUnits: parseUnitsExact(job.amount, job.decimals),
-            slippageBps: decision.maxSlippageBps,
+            slippageBps,
             assertCanSubmit: () => {
               const latest = evaluateTradePolicy(db, config, {
                 userId: job.user_id, chain: job.chain, side: "sell", amount: job.amount, source: job.source,

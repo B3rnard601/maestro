@@ -15,7 +15,14 @@ import { startPairListener } from "./chains/evm/pairListener.js";
 import { runEvmSafetyChecks } from "./chains/evm/safetyChecks.js";
 import { CopyTradeRegistry } from "./copytrade/registry.js";
 import { scaleTrade } from "./copytrade/engine.js";
-import { openDb, listActiveSnipers } from "./db/db.js";
+import {
+  openDb,
+  getAutoSnipeConfig,
+  listActiveAutoSnipes,
+  listActiveSnipers,
+  type AutoSnipeConfig,
+  type UserRow,
+} from "./db/db.js";
 import { startLimitOrderEngine } from "./orders/limitOrderEngine.js";
 import { evaluateTradePolicy } from "./risk/policy.js";
 import { formatUnitsExact, parseUnitsExact } from "./shared/amount.js";
@@ -77,12 +84,30 @@ async function main() {
     console.log(`[SOL] safety check for ${mint}: safe=${result.safe}`, result.reasons);
     if (!result.safe) return;
 
-    const snipers = listActiveSnipers(db, "solana");
-    for (const user of snipers) {
+    const snipers = new Map<
+      string,
+      { user: UserRow; amount: string; config: AutoSnipeConfig | null }
+    >(
+      listActiveSnipers(db, "solana").map((user) => [
+        user.telegram_id,
+        {
+          user,
+          amount: user.snipe_size_sol_exact ?? String(user.snipe_size_sol),
+          config: null,
+        },
+      ]),
+    );
+    for (const target of listActiveAutoSnipes(db, "solana", mint)) {
+      snipers.set(target.telegram_id, {
+        user: target,
+        amount: target.auto_snipe_amount,
+        config: getAutoSnipeConfig(db, target.telegram_id, "solana"),
+      });
+    }
+    for (const { user, amount, config: snipeConfig } of snipers.values()) {
       const wallet = getPrimarySolanaKeypair(vault, db, user.telegram_id);
       if (!wallet) continue; // enabled sniping before creating a wallet — nothing to do until they do
       try {
-        const amount = user.snipe_size_sol_exact ?? String(user.snipe_size_sol);
         const decision = evaluateTradePolicy(db, config, {
           userId: user.telegram_id,
           chain: "solana",
@@ -100,6 +125,11 @@ async function main() {
           asset: mint,
           amount,
           poolRef: keys.poolId,
+          requestedSlippageBps: snipeConfig?.slippage_bps,
+          antiMevEnabled: snipeConfig
+            ? snipeConfig.anti_mev_enabled === 1
+            : undefined,
+          tipLamports: snipeConfig?.tip_lamports,
         });
         console.info(`[queue] sniping entry queued: ${job.id} user=${user.telegram_id} mint=${mint}`);
       } catch (err) {
@@ -117,12 +147,30 @@ async function main() {
     console.log(`[EVM] safety check for ${newToken}: safe=${result.safe}`, result.reasons);
     if (!result.safe) return;
 
-    const snipers = listActiveSnipers(db, "evm");
-    for (const user of snipers) {
+    const snipers = new Map<
+      string,
+      { user: UserRow; amount: string; config: AutoSnipeConfig | null }
+    >(
+      listActiveSnipers(db, "evm").map((user) => [
+        user.telegram_id,
+        {
+          user,
+          amount: user.snipe_size_eth_exact ?? String(user.snipe_size_eth),
+          config: null,
+        },
+      ]),
+    );
+    for (const target of listActiveAutoSnipes(db, "evm", newToken)) {
+      snipers.set(target.telegram_id, {
+        user: target,
+        amount: target.auto_snipe_amount,
+        config: getAutoSnipeConfig(db, target.telegram_id, "evm"),
+      });
+    }
+    for (const { user, amount, config: snipeConfig } of snipers.values()) {
       const wallet = getPrimaryEvmWallet(vault, db, user.telegram_id);
       if (!wallet) continue;
       try {
-        const amount = user.snipe_size_eth_exact ?? String(user.snipe_size_eth);
         const decision = evaluateTradePolicy(db, config, {
           userId: user.telegram_id,
           chain: "evm",
@@ -140,6 +188,11 @@ async function main() {
           asset: newToken,
           amount,
           poolRef: event.pair,
+          requestedSlippageBps: snipeConfig?.slippage_bps,
+          antiMevEnabled: snipeConfig
+            ? snipeConfig.anti_mev_enabled === 1
+            : undefined,
+          tipLamports: snipeConfig?.tip_lamports,
         });
         console.info(`[queue] sniping entry queued: ${job.id} user=${user.telegram_id} token=${newToken}`);
       } catch (err) {
