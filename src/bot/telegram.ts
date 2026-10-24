@@ -37,8 +37,10 @@ import {
 import { formatNativeAmount, getRealizedPnl } from "../premium/analytics.js";
 import { startPremiumAlertWatcher } from "../premium/alerts.js";
 import {
+  addAutoSnipe,
   cancelPremiumPriceAlert,
   createPremiumPriceAlert,
+  getAutoSnipeConfig,
   getHoldings,
   getPremiumAccess,
   getPremiumStarsPrice,
@@ -71,6 +73,10 @@ import {
   listRecentTradesForUser,
   listRecentTradeJobsForUser,
   listPremiumPriceAlerts,
+  listAutoSnipesForUser,
+  removeAutoSnipe,
+  setAutoSnipeEnabled,
+  updateAutoSnipeConfig,
   addPresaleListing,
   countPresaleListings,
   countReferrals,
@@ -538,6 +544,22 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   };
   type PendingInput =
     | { kind: "snipe_size"; chain: "solana" | "evm" }
+    | {
+        kind: "auto_snipe";
+        chain: "solana" | "evm";
+        step: "asset";
+      }
+    | {
+        kind: "auto_snipe";
+        chain: "solana" | "evm";
+        step: "amount";
+        asset: string;
+      }
+    | {
+        kind: "auto_snipe_config";
+        chain: "solana" | "evm";
+        field: "slippage" | "tip";
+      }
     | {
         kind: "bridge_amount";
         fromChain: "solana" | "evm";
@@ -1624,24 +1646,81 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     }
   });
 
+  async function showAutoSnipeConfig(
+    ctx: any,
+    chain: "solana" | "evm",
+  ): Promise<void> {
+    const config = getAutoSnipeConfig(db, String(ctx.from!.id), chain);
+    const chainLabel = chain === "solana" ? "Solana" : "EVM";
+    const rows = [
+      [
+        Markup.button.callback(
+          `Set slippage (${config.slippage_bps} bps)`,
+          `home_snipe_config_slippage_${chain}`,
+        ),
+      ],
+      [
+        Markup.button.callback(
+          `Anti-MEV: ${config.anti_mev_enabled ? "ON" : "OFF"}`,
+          `home_snipe_config_mev_${chain}`,
+        ),
+      ],
+    ];
+    if (chain === "solana") {
+      rows.push([
+        Markup.button.callback(
+          "Set Jito tip",
+          "home_snipe_config_tip_solana",
+        ),
+      ]);
+    }
+    rows.push([Markup.button.callback("↩️ Auto Snipe", "home_snipe")]);
+    await ctx.reply(
+      `${tradingHeading("⚙️", `${chainLabel} Auto Snipe Defaults`)}\nThese defaults apply to new and active snipes on ${chainLabel}. The effective slippage never exceeds your trading-policy ceiling.\n\nSlippage: ${config.slippage_bps} bps\nAnti-MEV: ${config.anti_mev_enabled ? "ON" : "OFF"}${chain === "solana" ? `\nJito bundle tip: ${formatUnitsExact(BigInt(config.tip_lamports), 9)} SOL` : ""}`,
+      Markup.inlineKeyboard(rows),
+    );
+  }
+
   async function showSnipeSettings(ctx: any) {
     const user = getUser(db, String(ctx.from!.id))!;
-    await ctx.reply(
-      `AUTO-BUY · ${user.snipe_enabled ? "ON" : "OFF"}\n\nWhen enabled, new-pair detection can place real mainnet trades from your primary wallet.\n\nTrade sizes: ${user.snipe_size_sol_exact} SOL / ${user.snipe_size_eth_exact} ETH.\nYour per-buy limits: ${user.max_trade_sol_exact} SOL / ${user.max_trade_eth_exact} ETH (admin hard caps: ${tradingLimits.maxTradeSol} SOL / ${tradingLimits.maxTradeEth} ETH).`,
-      Markup.inlineKeyboard([
-        [
-          Markup.button.callback("✅ Enable", "home_snipe_enable"),
-          Markup.button.callback("⏸ Disable", "home_snipe_disable"),
-        ],
-        [
-          Markup.button.callback("Set SOL size", "home_snipe_size_solana"),
-          Markup.button.callback("Set ETH size", "home_snipe_size_evm"),
-        ],
-        [
-          Markup.button.callback("⚙️ Trading limits", "home_risk_settings"),
-          Markup.button.callback("↩️ Home", "home"),
-        ],
+    const autoSnipes = listAutoSnipesForUser(db, String(ctx.from!.id));
+    const snipesSummary = autoSnipes.length
+      ? autoSnipes
+          .map(
+            (snipe, index) =>
+              `${index + 1}. ${snipe.chain === "solana" ? "SOL" : "EVM"} · ${snipe.asset}\n   Buy: ${snipe.amount_exact} ${snipe.chain === "solana" ? "SOL" : "ETH"} · ${snipe.enabled ? "ACTIVE" : "PAUSED"}`,
+          )
+          .join("\n")
+      : "No token snipes configured.";
+    const keyboard = [
+      [Markup.button.callback("➕ Add token snipe", "home_snipe_add")],
+      ...autoSnipes.map((snipe, index) => [
+        Markup.button.callback(
+          `${snipe.enabled ? "⏸ Pause" : "▶️ Activate"} #${index + 1}`,
+          `home_snipe_toggle_${snipe.id}`,
+        ),
+        Markup.button.callback("🗑 Remove", `home_snipe_remove_${snipe.id}`),
       ]),
+      [
+        Markup.button.callback("✅ Global buy on", "home_snipe_enable"),
+        Markup.button.callback("⏸ Global buy off", "home_snipe_disable"),
+      ],
+      [
+        Markup.button.callback("Set SOL size", "home_snipe_size_solana"),
+        Markup.button.callback("Set ETH size", "home_snipe_size_evm"),
+      ],
+      [
+        Markup.button.callback("⚙️ SOL defaults", "home_snipe_config_solana"),
+        Markup.button.callback("⚙️ EVM defaults", "home_snipe_config_evm"),
+      ],
+      [
+        Markup.button.callback("⚙️ Trading limits", "home_risk_settings"),
+        Markup.button.callback("↩️ Home", "home"),
+      ],
+    ];
+    await ctx.reply(
+      `${tradingHeading("🎯", "Auto Snipe")}\nAdd a token address and buy amount to activate a snipe for that launch. Only active token entries are matched against detected Raydium pools and configured EVM pairs. A safety check and your trading limits still apply before a buy is queued.\n\n${snipesSummary}\n\nGlobal auto-buy: ${user.snipe_enabled ? "ON" : "OFF"} (buys qualifying launches beyond your saved token list).\nDefault sizes: ${user.snipe_size_sol_exact} SOL / ${user.snipe_size_eth_exact} ETH.\nPer-buy limits: ${user.max_trade_sol_exact} SOL / ${user.max_trade_eth_exact} ETH (admin hard caps: ${tradingLimits.maxTradeSol} SOL / ${tradingLimits.maxTradeEth} ETH).`,
+      Markup.inlineKeyboard(keyboard),
     );
   }
 
@@ -1731,6 +1810,104 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   bot.action("home_snipe", async (ctx) => {
     await ctx.answerCbQuery();
+    await showSnipeSettings(ctx);
+  });
+
+  bot.action(/^home_snipe_config_(solana|evm)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    await showAutoSnipeConfig(ctx, ctx.match[1] as "solana" | "evm");
+  });
+
+  bot.action(/^home_snipe_config_slippage_(solana|evm)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const chain = ctx.match[1] as "solana" | "evm";
+    pendingInputs.set(ctx.from!.id, {
+      kind: "auto_snipe_config",
+      chain,
+      field: "slippage",
+    });
+    await ctx.reply(
+      `Send slippage in basis points (1–${Math.min(getUser(db, String(ctx.from!.id))!.max_slippage_bps, tradingLimits.maxSlippageBps)}).`,
+      cancelPromptKeyboard,
+    );
+  });
+
+  bot.action(/^home_snipe_config_tip_solana$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    pendingInputs.set(ctx.from!.id, {
+      kind: "auto_snipe_config",
+      chain: "solana",
+      field: "tip",
+    });
+    await ctx.reply(
+      "Send the Jito bundle tip in SOL (0.000001–0.1). This is an additional mainnet payment when the bundle is submitted.",
+      cancelPromptKeyboard,
+    );
+  });
+
+  bot.action(/^home_snipe_config_mev_(solana|evm)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const chain = ctx.match[1] as "solana" | "evm";
+    const userId = String(ctx.from!.id);
+    const current = getAutoSnipeConfig(db, userId, chain);
+    updateAutoSnipeConfig(db, userId, chain, {
+      anti_mev_enabled: current.anti_mev_enabled ? 0 : 1,
+    });
+    await showAutoSnipeConfig(ctx, chain);
+  });
+
+  bot.action("home_snipe_add", async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.reply(
+      "Choose the network for this token snipe. A primary wallet is required on that network.",
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("Solana", "home_snipe_add_solana"),
+          Markup.button.callback("EVM", "home_snipe_add_evm"),
+        ],
+        [Markup.button.callback("↩️ Auto Snipe", "home_snipe")],
+      ]),
+    );
+  });
+
+  bot.action(/^home_snipe_add_(solana|evm)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const chain = ctx.match[1] as "solana" | "evm";
+    const userId = String(ctx.from!.id);
+    if (!getPrimaryWallet(db, userId, chain)) {
+      await ctx.reply(
+        `Add a primary ${chain === "solana" ? "Solana" : "EVM"} wallet before creating a token snipe.`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("💼 Manage wallets", "home_wallets")],
+          [Markup.button.callback("↩️ Auto Snipe", "home_snipe")],
+        ]),
+      );
+      return;
+    }
+    pendingInputs.set(ctx.from!.id, { kind: "auto_snipe", chain, step: "asset" });
+    await ctx.reply(
+      `Send the ${chain === "solana" ? "Solana mint" : "EVM token contract address"} to watch.`,
+      cancelPromptKeyboard,
+    );
+  });
+
+  bot.action(/^home_snipe_toggle_([0-9a-f-]{36})$/i, async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = String(ctx.from!.id);
+    const snipe = listAutoSnipesForUser(db, userId).find(
+      (item) => item.id === ctx.match[1],
+    );
+    if (!snipe) {
+      await ctx.reply("That token snipe is no longer available.");
+      return;
+    }
+    setAutoSnipeEnabled(db, userId, snipe.id, !snipe.enabled);
+    await showSnipeSettings(ctx);
+  });
+
+  bot.action(/^home_snipe_remove_([0-9a-f-]{36})$/i, async (ctx) => {
+    await ctx.answerCbQuery();
+    removeAutoSnipe(db, String(ctx.from!.id), ctx.match[1]);
     await showSnipeSettings(ctx);
   });
 
@@ -2759,6 +2936,119 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
             [Markup.button.callback("Home", "home")],
           ]),
         );
+        return;
+      }
+
+      if (pendingInput.kind === "auto_snipe_config") {
+        const userId = String(ctx.from!.id);
+        if (pendingInput.field === "slippage") {
+          const maximum = Math.min(
+            getUser(db, userId)!.max_slippage_bps,
+            tradingLimits.maxSlippageBps,
+          );
+          if (
+            !/^\d+$/.test(input) ||
+            Number(input) < 1 ||
+            Number(input) > maximum
+          ) {
+            return keepPrompt(
+              `Enter a whole number from 1 to ${maximum} basis points.`,
+            );
+          }
+          updateAutoSnipeConfig(db, userId, pendingInput.chain, {
+            slippage_bps: Number(input),
+          });
+        } else {
+          if (!isPositiveDecimal(input, 9)) {
+            return keepPrompt(
+              "Enter a positive SOL amount with at most 9 decimal places.",
+            );
+          }
+          const tipLamports = parseUnitsExact(input, 9);
+          if (tipLamports < 1_000n || tipLamports > 100_000_000n) {
+            return keepPrompt("The Jito tip must be between 0.000001 and 0.1 SOL.");
+          }
+          updateAutoSnipeConfig(db, userId, "solana", {
+            tip_lamports: Number(tipLamports),
+          });
+        }
+        await showAutoSnipeConfig(ctx, pendingInput.chain);
+        return;
+      }
+
+      if (pendingInput.kind === "auto_snipe") {
+        if (pendingInput.step === "asset") {
+          let asset: string;
+          if (pendingInput.chain === "solana") {
+            try {
+              asset = new PublicKey(input).toBase58();
+            } catch {
+              return keepPrompt("Enter a valid Solana token mint.");
+            }
+          } else {
+            if (!isAddress(input)) {
+              return keepPrompt("Enter a valid EVM token contract address.");
+            }
+            try {
+              asset = getAddress(input);
+            } catch {
+              return keepPrompt("Enter a valid EVM token contract address.");
+            }
+          }
+          pendingInputs.set(ctx.from!.id, {
+            kind: "auto_snipe",
+            chain: pendingInput.chain,
+            step: "amount",
+            asset,
+          });
+          await ctx.reply(
+            `Send the buy amount in ${pendingInput.chain === "solana" ? "SOL" : "ETH"}. This is a real mainnet trade if the watched token launches and passes safety checks.`,
+            cancelPromptKeyboard,
+          );
+          return;
+        }
+
+        const decimals = pendingInput.chain === "solana" ? 9 : 18;
+        const user = getUser(db, String(ctx.from!.id))!;
+        const userCap =
+          pendingInput.chain === "solana"
+            ? user.max_trade_sol_exact
+            : user.max_trade_eth_exact;
+        const hardCap =
+          pendingInput.chain === "solana"
+            ? tradingLimits.maxTradeSol
+            : tradingLimits.maxTradeEth;
+        const cap =
+          parseUnitsExact(userCap, decimals) < parseUnitsExact(hardCap, decimals)
+            ? userCap
+            : hardCap;
+        if (!isPositiveDecimal(input, decimals)) {
+          return keepPrompt(
+            `Enter a positive amount with at most ${decimals} decimal places.`,
+          );
+        }
+        if (parseUnitsExact(input, decimals) > parseUnitsExact(cap, decimals)) {
+          return keepPrompt(`The configured maximum is ${cap}.`);
+        }
+        const amount = Number(input);
+        if (!Number.isFinite(amount)) {
+          return keepPrompt("That amount is outside the supported range.");
+        }
+        const added = addAutoSnipe(db, {
+          id: randomUUID(),
+          userId: String(ctx.from!.id),
+          chain: pendingInput.chain,
+          asset: pendingInput.asset,
+          amount,
+          amountExact: input,
+        });
+        if (!added) {
+          await ctx.reply("That token already has a saved snipe on this network.");
+          await showSnipeSettings(ctx);
+          return;
+        }
+        await ctx.reply("Token snipe saved and activated.");
+        await showSnipeSettings(ctx);
         return;
       }
 

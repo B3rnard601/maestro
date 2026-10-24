@@ -1,15 +1,117 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  addAutoSnipe,
   addPresaleListing,
+  claimNextTradeJob,
   countPresaleListings,
   countReferrals,
+  enqueueTradeJob,
+  getAutoSnipeConfig,
   getOrCreateUser,
+  listActiveAutoSnipes,
+  listAutoSnipesForUser,
   listPresaleListings,
   openDb,
   recordReferralAttribution,
+  removeAutoSnipe,
   removePresaleListing,
+  setAutoSnipeEnabled,
+  updateAutoSnipeConfig,
 } from "../src/db/db.js";
+
+test("auto-snipe defaults persist and are copied into queued trade settings", () => {
+  const db = openDb(":memory:");
+  try {
+    const defaults = getAutoSnipeConfig(db, "10", "solana");
+    assert.equal(defaults.slippage_bps, 500);
+    assert.equal(defaults.anti_mev_enabled, 1);
+    assert.equal(defaults.tip_lamports, 100_000);
+
+    updateAutoSnipeConfig(db, "10", "solana", {
+      slippage_bps: 275,
+      anti_mev_enabled: 0,
+      tip_lamports: 250_000,
+    });
+    assert.deepEqual(
+      {
+        slippage: getAutoSnipeConfig(db, "10", "solana").slippage_bps,
+        antiMev: getAutoSnipeConfig(db, "10", "solana").anti_mev_enabled,
+        tip: getAutoSnipeConfig(db, "10", "solana").tip_lamports,
+      },
+      { slippage: 275, antiMev: 0, tip: 250_000 },
+    );
+
+    enqueueTradeJob(db, {
+      dedupeKey: "snipe-config",
+      userId: "10",
+      chain: "solana",
+      side: "buy",
+      source: "sniper",
+      asset: "mint",
+      amount: "0.1",
+      poolRef: "pool",
+      requestedSlippageBps: 275,
+      antiMevEnabled: false,
+      tipLamports: 250_000,
+    });
+    const job = claimNextTradeJob(db);
+    assert.equal(job?.requested_slippage_bps, 275);
+    assert.equal(job?.anti_mev_enabled, 0);
+    assert.equal(job?.tip_lamports, 250_000);
+  } finally {
+    db.close();
+  }
+});
+
+test("auto-snipes are scoped to a user and match active targets by chain", () => {
+  const db = openDb(":memory:");
+  try {
+    getOrCreateUser(db, "10", "solana-user");
+    getOrCreateUser(db, "20", "evm-user");
+    db.prepare("UPDATE users SET status = 'active'").run();
+
+    const solanaSnipe = {
+      id: "solana-snipe",
+      userId: "10",
+      chain: "solana" as const,
+      asset: "So11111111111111111111111111111111111112",
+      amount: 0.25,
+      amountExact: "0.25",
+    };
+    const evmSnipe = {
+      id: "evm-snipe",
+      userId: "20",
+      chain: "evm" as const,
+      asset: "0x0000000000000000000000000000000000000001",
+      amount: 0.05,
+      amountExact: "0.05",
+    };
+    assert.equal(addAutoSnipe(db, solanaSnipe), true);
+    assert.equal(addAutoSnipe(db, evmSnipe), true);
+    assert.equal(addAutoSnipe(db, { ...evmSnipe, id: "duplicate" }), false);
+    assert.equal(
+      listActiveAutoSnipes(db, "solana", solanaSnipe.asset)[0].telegram_id,
+      "10",
+    );
+    assert.equal(
+      listActiveAutoSnipes(db, "evm", evmSnipe.asset.toUpperCase())[0]
+        .auto_snipe_amount,
+      "0.05",
+    );
+    assert.equal(listActiveAutoSnipes(db, "solana", evmSnipe.asset).length, 0);
+    assert.equal(listAutoSnipesForUser(db, "10").length, 1);
+
+    assert.equal(setAutoSnipeEnabled(db, "other-user", "solana-snipe", false), false);
+    assert.equal(setAutoSnipeEnabled(db, "10", "solana-snipe", false), true);
+    assert.equal(listActiveAutoSnipes(db, "solana", solanaSnipe.asset).length, 0);
+    assert.equal(removeAutoSnipe(db, "other-user", "solana-snipe"), false);
+    assert.equal(removeAutoSnipe(db, "10", "solana-snipe"), true);
+    assert.equal(listAutoSnipesForUser(db, "10").length, 0);
+  } finally {
+    db.close();
+  }
+});
 
 test("presales and referral features persist safely", () => {
   const db = openDb(":memory:");

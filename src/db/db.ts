@@ -39,6 +39,30 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       created_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS auto_snipes (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
+      asset TEXT NOT NULL,
+      amount REAL NOT NULL,
+      amount_exact TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+      created_at INTEGER NOT NULL,
+      UNIQUE(user_id, chain, asset)
+    );
+    CREATE INDEX IF NOT EXISTS auto_snipes_active_target
+      ON auto_snipes(chain, asset, enabled);
+
+    CREATE TABLE IF NOT EXISTS auto_snipe_config (
+      user_id TEXT NOT NULL,
+      chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
+      slippage_bps INTEGER NOT NULL DEFAULT 500,
+      anti_mev_enabled INTEGER NOT NULL DEFAULT 1 CHECK(anti_mev_enabled IN (0,1)),
+      tip_lamports INTEGER NOT NULL DEFAULT 100000 CHECK(tip_lamports >= 0),
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(user_id, chain)
+    );
+
     CREATE TABLE IF NOT EXISTS limit_orders (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -242,6 +266,9 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       amount TEXT NOT NULL,
       pool_ref TEXT,
       decimals INTEGER,
+      requested_slippage_bps INTEGER,
+      anti_mev_enabled INTEGER,
+      tip_lamports INTEGER,
       limit_order_id TEXT,
       status TEXT NOT NULL CHECK(status IN ('queued','processing','submitted','completed','failed')),
       priority INTEGER NOT NULL DEFAULT 0,
@@ -363,6 +390,9 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
   ensureColumn("users", "admin_flag_message", "TEXT");
   db.exec(`UPDATE users SET admin_flagged = 1 WHERE admin_flag_message IS NOT NULL AND admin_flagged = 0`);
   ensureColumn("trade_lifecycle", "job_id", "TEXT");
+  ensureColumn("trade_jobs", "requested_slippage_bps", "INTEGER");
+  ensureColumn("trade_jobs", "anti_mev_enabled", "INTEGER");
+  ensureColumn("trade_jobs", "tip_lamports", "INTEGER");
   const legacyUsers = db.prepare(`SELECT telegram_id, snipe_size_sol, snipe_size_sol_exact, snipe_size_eth, snipe_size_eth_exact,
     copy_size_ratio, copy_size_ratio_exact, copy_max_amount, copy_max_amount_exact FROM users`).all() as Array<{
       telegram_id: string;
@@ -1081,6 +1111,9 @@ export interface TradeJobInput {
   amount: string;
   poolRef?: string;
   decimals?: number;
+  requestedSlippageBps?: number;
+  antiMevEnabled?: boolean;
+  tipLamports?: number;
   limitOrderId?: string;
 }
 
@@ -1095,6 +1128,9 @@ export interface TradeJobRow {
   amount: string;
   pool_ref: string | null;
   decimals: number | null;
+  requested_slippage_bps: number | null;
+  anti_mev_enabled: number | null;
+  tip_lamports: number | null;
   limit_order_id: string | null;
   status: "queued" | "processing" | "submitted" | "completed" | "failed";
   priority: number;
@@ -1111,9 +1147,10 @@ export function enqueueTradeJob(db: Database.Database, job: TradeJobInput): Trad
   const now = Date.now();
   const id = randomUUID();
   db.prepare(`INSERT OR IGNORE INTO trade_jobs
-    (id, dedupe_key, user_id, chain, side, source, asset, amount, pool_ref, decimals, limit_order_id,
+    (id, dedupe_key, user_id, chain, side, source, asset, amount, pool_ref, decimals,
+      requested_slippage_bps, anti_mev_enabled, tip_lamports, limit_order_id,
       status, priority, available_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`).run(
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`).run(
     id,
     job.dedupeKey,
     job.userId,
@@ -1124,6 +1161,9 @@ export function enqueueTradeJob(db: Database.Database, job: TradeJobInput): Trad
     job.amount,
     job.poolRef ?? null,
     job.decimals ?? null,
+    job.requestedSlippageBps ?? null,
+    job.antiMevEnabled === undefined ? null : job.antiMevEnabled ? 1 : 0,
+    job.tipLamports ?? null,
     job.limitOrderId ?? null,
     job.source === "sniper" && isPremiumActive(db, job.userId) ? 1 : 0,
     now,
@@ -1418,6 +1458,150 @@ export function listActiveSnipers(db: Database.Database, chain: "solana" | "evm"
   return db
     .prepare(`SELECT * FROM users WHERE status = 'active' AND snipe_enabled = 1`)
     .all() as UserRow[];
+}
+
+export interface AutoSnipeConfig {
+  user_id: string;
+  chain: "solana" | "evm";
+  slippage_bps: number;
+  anti_mev_enabled: number;
+  tip_lamports: number;
+  updated_at: number;
+}
+
+export function getAutoSnipeConfig(
+  db: Database.Database,
+  userId: string,
+  chain: "solana" | "evm",
+): AutoSnipeConfig {
+  const row = db.prepare(
+    `SELECT * FROM auto_snipe_config WHERE user_id = ? AND chain = ?`,
+  ).get(userId, chain) as AutoSnipeConfig | undefined;
+  return row ?? {
+    user_id: userId,
+    chain,
+    slippage_bps: 500,
+    anti_mev_enabled: 1,
+    tip_lamports: 100_000,
+    updated_at: 0,
+  };
+}
+
+export function updateAutoSnipeConfig(
+  db: Database.Database,
+  userId: string,
+  chain: "solana" | "evm",
+  patch: Partial<Pick<AutoSnipeConfig, "slippage_bps" | "anti_mev_enabled" | "tip_lamports">>,
+): AutoSnipeConfig {
+  const current = getAutoSnipeConfig(db, userId, chain);
+  const next = { ...current, ...patch, updated_at: Date.now() };
+  db.prepare(
+    `INSERT INTO auto_snipe_config
+      (user_id, chain, slippage_bps, anti_mev_enabled, tip_lamports, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, chain) DO UPDATE SET
+       slippage_bps = excluded.slippage_bps,
+       anti_mev_enabled = excluded.anti_mev_enabled,
+       tip_lamports = excluded.tip_lamports,
+       updated_at = excluded.updated_at`,
+  ).run(
+    userId,
+    chain,
+    next.slippage_bps,
+    next.anti_mev_enabled,
+    next.tip_lamports,
+    next.updated_at,
+  );
+  return next;
+}
+
+export interface AutoSnipeRow {
+  id: string;
+  user_id: string;
+  chain: "solana" | "evm";
+  asset: string;
+  amount: number;
+  amount_exact: string;
+  enabled: number;
+  created_at: number;
+}
+
+export function addAutoSnipe(
+  db: Database.Database,
+  input: {
+    id: string;
+    userId: string;
+    chain: "solana" | "evm";
+    asset: string;
+    amount: number;
+    amountExact: string;
+  },
+): boolean {
+  const result = db.prepare(
+    `INSERT OR IGNORE INTO auto_snipes
+      (id, user_id, chain, asset, amount, amount_exact, enabled, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+  ).run(
+    input.id,
+    input.userId,
+    input.chain,
+    input.asset,
+    input.amount,
+    input.amountExact,
+    Date.now(),
+  );
+  return result.changes === 1;
+}
+
+export function listAutoSnipesForUser(
+  db: Database.Database,
+  userId: string,
+): AutoSnipeRow[] {
+  return db.prepare(
+    `SELECT * FROM auto_snipes WHERE user_id = ? ORDER BY created_at DESC`,
+  ).all(userId) as AutoSnipeRow[];
+}
+
+export function listActiveAutoSnipes(
+  db: Database.Database,
+  chain: "solana" | "evm",
+  asset: string,
+): (UserRow & { auto_snipe_amount: string })[] {
+  const query = chain === "evm"
+    ? `SELECT users.*, auto_snipes.amount_exact AS auto_snipe_amount
+       FROM auto_snipes JOIN users ON users.telegram_id = auto_snipes.user_id
+       WHERE auto_snipes.chain = ? AND lower(auto_snipes.asset) = lower(?)
+         AND auto_snipes.enabled = 1 AND users.status = 'active'`
+    : `SELECT users.*, auto_snipes.amount_exact AS auto_snipe_amount
+       FROM auto_snipes JOIN users ON users.telegram_id = auto_snipes.user_id
+       WHERE auto_snipes.chain = ? AND auto_snipes.asset = ?
+         AND auto_snipes.enabled = 1 AND users.status = 'active'`;
+  return db.prepare(query).all(chain, asset) as (UserRow & {
+    auto_snipe_amount: string;
+  })[];
+}
+
+export function setAutoSnipeEnabled(
+  db: Database.Database,
+  userId: string,
+  id: string,
+  enabled: boolean,
+): boolean {
+  const result = db.prepare(
+    `UPDATE auto_snipes SET enabled = ? WHERE id = ? AND user_id = ?`,
+  ).run(enabled ? 1 : 0, id, userId);
+  return result.changes === 1;
+}
+
+export function removeAutoSnipe(
+  db: Database.Database,
+  userId: string,
+  id: string,
+): boolean {
+  const result = db.prepare(
+    `DELETE FROM auto_snipes WHERE id = ? AND user_id = ?`,
+  ).run(id, userId);
+  return result.changes === 1;
 }
 
 /** Users following a copy-trade target, grouped implicitly by copy_target — the registry queries this per target. */
