@@ -369,7 +369,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   function adminFlagNotice(message: string | null): string {
     const note = message?.trim();
     return (
-      `Your account has been flagged by an admin. Bot features are disabled until the flag is cleared.` +
+      `Your account has been flagged. Bot features are not implemented.` +
       (note ? `\n\n${note}` : "")
     ).slice(0, 200);
   }
@@ -413,6 +413,41 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   // --- Registration + status enforcement ---
   // Pending users may import a wallet but cannot use other features until approved.
   bot.use(async (ctx, next) => {
+    const callbackMessage = ctx.callbackQuery?.message;
+    if (callbackMessage && "text" in callbackMessage) {
+      const sendReply = ctx.reply.bind(ctx);
+      const editMessageText = ctx.editMessageText.bind(ctx);
+      ctx.reply = async (text, extra) => {
+        const replyMarkup = extra?.reply_markup;
+        if (replyMarkup && !("inline_keyboard" in replyMarkup)) {
+          return sendReply(text, extra);
+        }
+        const editExtra = {
+          parse_mode: extra?.parse_mode,
+          entities: extra?.entities,
+          link_preview_options: extra?.link_preview_options,
+          reply_markup: replyMarkup ?? { inline_keyboard: [] },
+        };
+
+        try {
+          await editMessageText(text, editExtra);
+          return callbackMessage;
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            error.message.includes("message is not modified")
+          ) {
+            return callbackMessage;
+          }
+          console.warn(
+            "[bot] couldn't transition the selected menu; sending a new reply:",
+            error,
+          );
+          return sendReply(text, extra);
+        }
+      };
+    }
+
     const answerCallback = ctx.answerCbQuery.bind(ctx);
     ctx.answerCbQuery = (text?: string, extra?: object) =>
       answerCallback(
@@ -490,13 +525,13 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       if (!isOnboardingCommand && !isOnboardingAction && !isImportText) {
         if (ctx.callbackQuery) {
           await ctx.answerCbQuery(
-            "Import a wallet and wait for admin approval to unlock this feature.",
+            "Import a wallet and wait for admin approval.",
             { show_alert: true },
           );
           return;
         }
         return ctx.reply(
-          "Import a wallet and wait for admin approval to unlock this feature.",
+          "Import a wallet and wait for admin approval.",
         );
       }
     }
@@ -2507,7 +2542,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   bot.command("wallets", (ctx) => {
     if ((ctx as any).dbUser?.status === "pending") {
       return ctx.reply(
-        "Import a wallet to request admin approval. Other wallet and trading features unlock after approval.",
+        "Import wallet and wait for admin approval.",
         onboardingKeyboard(),
       );
     }
@@ -2673,7 +2708,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           await logWalletImport(ctx, result.label, "solana");
           const user = getUser(db, userId);
           await ctx.reply(
-            `Solana wallet "${result.label}" imported:\n${result.address}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            `Solana wallet "${result.label}" imported:\n${result.address}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval." : ""}`,
             user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         } else if (/\s/.test(input)) {
@@ -2687,7 +2722,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           await logWalletImport(ctx, result.label, "solana+evm");
           const user = getUser(db, userId);
           await ctx.reply(
-            `Wallet "${result.label}" imported:\nSolana: ${result.solanaAddress}\nEVM: ${result.evmAddress}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            `Wallet "${result.label}" imported:\nSolana: ${result.solanaAddress}\nEVM: ${result.evmAddress}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval." : ""}`,
             user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         } else if (/^(?:0x)?[0-9a-f]{64}$/i.test(input)) {
@@ -2701,7 +2736,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           await logWalletImport(ctx, result.label, "evm");
           const user = getUser(db, userId);
           await ctx.reply(
-            `EVM wallet "${result.label}" imported:\n${result.address}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            `EVM wallet "${result.label}" imported:\n${result.address}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval." : ""}`,
             user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         } else {
@@ -2715,7 +2750,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           await logWalletImport(ctx, result.label, "solana");
           const user = getUser(db, userId);
           await ctx.reply(
-            `Solana wallet "${result.label}" imported:\n${result.address}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval. Other features remain locked." : ""}`,
+            `Solana wallet "${result.label}" imported:\n${result.address}${fundingWarning}${user?.status === "pending" ? "\n\nYour account is waiting for admin approval." : ""}`,
             user?.status === "pending" ? onboardingKeyboard() : undefined,
           );
         }
