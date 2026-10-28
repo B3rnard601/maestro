@@ -369,7 +369,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
   function adminFlagNotice(message: string | null): string {
     const note = message?.trim();
     return (
-      `Your account has been flagged. Bot features are not implemented.` +
+      `Your account has been flagged. Features are not implemented.` +
       (note ? `\n\n${note}` : "")
     ).slice(0, 200);
   }

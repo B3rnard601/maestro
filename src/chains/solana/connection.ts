@@ -1,4 +1,5 @@
 import { Connection } from "@solana/web3.js";
+import { DEFAULT_RPC_ENDPOINTS } from "../../config/defaults.js";
 
 /**
  * Same failure class as chains/evm/provider.ts: a WebSocket connection
@@ -11,17 +12,17 @@ import { Connection } from "@solana/web3.js";
  * removes it, this handler silently stops attaching — worth a smoke test
  * after any @solana/web3.js version bump.
  */
-export function getSolanaConnection(): Connection {
-  const http = process.env.SOLANA_RPC_HTTP!;
-  const wss = process.env.SOLANA_RPC_WSS!;
+export function getSolanaConnection(
+  http: string = DEFAULT_RPC_ENDPOINTS.solanaHttp,
+  wss: string = DEFAULT_RPC_ENDPOINTS.solanaWebSocket,
+): Connection {
   const connection = new Connection(http, { commitment: "confirmed", wsEndpoint: wss });
 
   (connection as any)._rpcWebSocket?.on("error", (err: Error) => {
     console.error(
       `[solana] WebSocket connection failed: ${err.message}\n` +
-        "Check SOLANA_RPC_WSS in .env — public endpoints are often unreliable for a persistent connection. Get a free-tier key from Helius or Triton instead."
+        "The bot will stay online, but Solana event listening may be unavailable until the provider reconnects. Configure SOLANA_RPC_WSS for a more reliable connection."
     );
-    process.exit(1);
   });
 
   return connection;

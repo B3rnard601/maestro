@@ -1,5 +1,6 @@
 import { isAddress } from "ethers";
 import { parseUnitsExact } from "../shared/amount.js";
+import { DEFAULT_RPC_ENDPOINTS } from "./defaults.js";
 
 export interface AppConfig {
   telegramBotToken: string;
@@ -24,10 +25,12 @@ function readUrl(
   env: NodeJS.ProcessEnv,
   name: string,
   protocols: string[],
-  errors: string[]
+  errors: string[],
+  fallback?: string,
 ): string {
   const value = env[name]?.trim();
   if (!value) {
+    if (fallback) return fallback;
     errors.push(`${name} is required.`);
     return "";
   }
@@ -69,8 +72,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!/^[0-9a-fA-F]{64}$/.test(vaultMasterKey)) errors.push("VAULT_MASTER_KEY must be exactly 32 bytes encoded as 64 hexadecimal characters.");
   if (!isAddress(uniswapV2Factory)) errors.push("UNISWAP_V2_FACTORY must be a valid EVM address.");
 
-  const solanaRpcHttp = readUrl(env, "SOLANA_RPC_HTTP", ["http:", "https:"], errors);
-  const solanaRpcWss = readUrl(env, "SOLANA_RPC_WSS", ["ws:", "wss:"], errors);
+  const solanaRpcHttp = readUrl(env, "SOLANA_RPC_HTTP", ["http:", "https:"], errors, DEFAULT_RPC_ENDPOINTS.solanaHttp);
+  const solanaRpcWss = readUrl(env, "SOLANA_RPC_WSS", ["ws:", "wss:"], errors, DEFAULT_RPC_ENDPOINTS.solanaWebSocket);
   const solanaJitoBlockEngine = readUrl(env, "SOLANA_JITO_BLOCK_ENGINE", ["http:", "https:"], errors);
   const evmRpcHttp = readUrl(env, "EVM_RPC_HTTP", ["http:", "https:"], errors);
   const evmRpcWss = readUrl(env, "EVM_RPC_WSS", ["ws:", "wss:"], errors);
