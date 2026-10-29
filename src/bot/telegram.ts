@@ -1133,7 +1133,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     if ((ctx as any).dbUser?.status === "pending") {
       return ctx.reply(
-        "Import a wallet to request admin approval. Other wallet and trading features not implemented yet.",
+        "Import a wallet to request admin approval. Features not implemented yet.",
         onboardingKeyboard(),
       );
     }
