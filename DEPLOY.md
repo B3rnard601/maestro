@@ -4,7 +4,9 @@
 
 - Node.js 18+
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- **Low-latency RPC access** — public RPCs will lose every race:
+- **Optional low-latency RPC access** — the bot can use public Solana RPC
+  endpoints without a provider key. Public RPCs are rate-limited and may delay
+  or miss event subscriptions; for faster Solana sniping use:
   - Solana: Helius or Triton (Geyser-backed)
   - EVM: Alchemy or Infura (websocket-capable)
 - Jito block engine access (Solana bundle submission — no signup needed, just the endpoint)
@@ -21,7 +23,7 @@ cp .env.example .env
 Fill in `.env`:
 - `TELEGRAM_BOT_TOKEN` — from BotFather
 - `TELEGRAM_OWNER_ID` — your numeric Telegram id, promotes you to admin on first contact (see the comment in `.env.example` for what this does and doesn't gate)
-- `SOLANA_RPC_HTTP` / `SOLANA_RPC_WSS` — your Helius/Triton endpoints
+- `SOLANA_RPC_HTTP` / `SOLANA_RPC_WSS` — optional overrides; leave blank or unset to use public Solana endpoints. No Solana provider key is required. Public WebSocket subscriptions can delay or miss new-pool auto-sniping and Solana copy-trading events. Solana wallet/portfolio queries, quotes, trades, safety checks, and transaction-status checks use HTTP and remain subject to public endpoint rate limits.
 - `EVM_RPC_HTTP` / `EVM_RPC_WSS` — your Alchemy/Infura endpoints
 - `MAX_TRADE_SOL` / `MAX_TRADE_ETH` — admin hard maximum spend for each buy, defaulting to `0.1` SOL / `0.05` ETH.
 - `MAX_DAILY_SPEND_SOL` / `MAX_DAILY_SPEND_ETH` — admin hard maximum buy spend per user and UTC day, defaulting to `1` SOL / `0.5` ETH. Personal limits are configurable in Telegram but cannot exceed these values.

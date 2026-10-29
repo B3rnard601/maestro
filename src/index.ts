@@ -57,7 +57,7 @@ async function main() {
   const vault = new WalletVault(config.vaultMasterKey, "./data/vault.json");
   const db = openDb();
 
-  const solConn = getSolanaConnection();
+  const solConn = getSolanaConnection(config.solanaRpcHttp, config.solanaRpcWss);
   const evmProvider = getEvmWsProvider();
   const evmHttp = getEvmHttpProvider();
   const simWallet = EvmWallet.createRandom().address; // no funds needed — safety checks use state overrides
