@@ -1,6 +1,8 @@
 import { FmtString } from "telegraf/format";
 
 const SECTION_RULE = "━━━━━━━━━━━━━━━━";
+export const SUPPORT_CONTACT =
+  "Need help? Contact @MaestroAutoSnipe_Support: https://t.me/MaestroAutoSniper_Bot";
 
 export function styleBotResponse(text: string, maxLength?: number): string;
 export function styleBotResponse(text: FmtString<string>): FmtString<string>;
@@ -46,6 +48,8 @@ export function startWelcome(firstName: string, requiresApproval: boolean): stri
     requiresApproval
       ? "Import a wallet and wait for admin approval to unlock account features."
       : "Choose a section below to get started.",
+    "",
+    SUPPORT_CONTACT,
   ].join("\n");
 }
 

@@ -3,6 +3,7 @@ import test from "node:test";
 import { FmtString } from "telegraf/format";
 import {
   styleBotResponse,
+  SUPPORT_CONTACT,
   startWelcome,
   tradingHeading,
   tradingSide,
@@ -40,19 +41,21 @@ test("start welcome stays consistent while explaining account access", () => {
   const pendingWelcome = startWelcome("justincallz", true);
 
   assert.equal(
-    activeWelcome.split("\n").slice(0, -1).join("\n"),
-    pendingWelcome.split("\n").slice(0, -1).join("\n"),
+    activeWelcome.split("\n").slice(0, -3).join("\n"),
+    pendingWelcome.split("\n").slice(0, -3).join("\n"),
   );
   assert.match(activeWelcome, /✨ Welcome, justincallz, to Maestro/);
   assert.match(activeWelcome, /curated presales/);
   assert.match(activeWelcome, /quote-only bridge route/);
   assert.match(activeWelcome, /BUY & SELL NOW/);
   assert.match(activeWelcome, /Choose a section below to get started\./);
+  assert.ok(activeWelcome.includes(SUPPORT_CONTACT));
   assert.match(pendingWelcome, /✨ Welcome, justincallz, to Maestro/);
   assert.match(
     pendingWelcome,
     /Import a wallet and wait for admin approval/,
   );
+  assert.ok(pendingWelcome.includes(SUPPORT_CONTACT));
   assert.equal(
     startWelcome("  ", false).startsWith("✨ Welcome, trader, to Maestro"),
     true,

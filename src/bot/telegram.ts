@@ -100,6 +100,7 @@ import { assertBuyEntryEnabled, evaluateTradePolicy } from "../risk/policy.js";
 import { formatUnitsExact } from "../shared/amount.js";
 import {
   styleBotResponse,
+  SUPPORT_CONTACT,
   startWelcome,
   tradingHeading,
   tradingSide,
@@ -189,7 +190,9 @@ export interface BotDeps {
 
 const HELP_TEXT = `✨ MAESTRO
 
-Use the buttons below to manage wallets, portfolio, auto-buy, copy trading, limit orders, curated presales, referrals, and quote-only bridge routes. Signals open premium price alerts. When an action needs an address or amount, the bot will prompt you for it.`;
+Use the buttons below to manage wallets, portfolio, auto-buy, copy trading, limit orders, curated presales, referrals, and quote-only bridge routes. Signals open premium price alerts. When an action needs an address or amount, the bot will prompt you for it.
+
+${SUPPORT_CONTACT}`;
 
 function homeKeyboard(isAdmin: boolean) {
   const rows = [
@@ -1133,7 +1136,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     await ctx.answerCbQuery();
     if ((ctx as any).dbUser?.status === "pending") {
       return ctx.reply(
-        "Import a wallet to request admin approval. Other wallet and trading features not implemented yet.",
+        "Import a wallet to request admin approval. Features not implemented yet.",
         onboardingKeyboard(),
       );
     }
