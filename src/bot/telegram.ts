@@ -107,6 +107,7 @@ import {
   tradingStatus,
   triggerDirection,
 } from "./presentation.js";
+import { isFlagRestrictedUpdate } from "./flag-policy.js";
 import { getNativeBridgeQuote } from "../bridge/lifi.js";
 import type { Wallet as EvmWallet } from "ethers";
 import { beginTrackedTrade } from "../transactions/tracker.js";
@@ -480,7 +481,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
     const referrerId = startText?.match(
       /^\/start(?:@\w+)?\s+ref_(\d+)(?:\s|$)/,
     )?.[1];
-    if (isNew && referrerId) {
+    if (isNew && referrerId && !user.admin_flagged) {
       recordReferralAttribution(db, referrerId, user.telegram_id);
     }
     (ctx as any).dbUser = user;
@@ -494,12 +495,35 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       return ctx.reply("Your access to this bot has been revoked.");
     }
 
-    if (user.role !== "admin" && user.admin_flagged) {
+    const text = (ctx.message as any)?.text as string | undefined;
+    const command = text?.match(/^\/([a-z0-9_]+)(?:@\w+)?/i)?.[1];
+    const callbackData = (ctx.callbackQuery as any)?.data as string | undefined;
+    const pendingInput = ctx.from ? pendingInputs.get(ctx.from.id) : undefined;
+    const isRestricted = isFlagRestrictedUpdate({
+      command,
+      callbackData,
+      updateType: ctx.updateType,
+      pendingInputKind:
+        text && !text.startsWith("/") ? pendingInput?.kind : undefined,
+      canEnableSnipe:
+        callbackData?.startsWith("home_snipe_toggle_") &&
+        listAutoSnipesForUser(db, user.telegram_id).some(
+          (snipe) =>
+            snipe.id === callbackData.slice("home_snipe_toggle_".length) &&
+            !snipe.enabled,
+        ),
+    });
+    if (user.role !== "admin" && user.admin_flagged && isRestricted) {
       const notice = adminFlagNotice(user.admin_flag_message);
+      if (ctx.updateType === "pre_checkout_query") {
+        await ctx.answerPreCheckoutQuery(false, notice);
+        return;
+      }
       if (ctx.callbackQuery) {
         await ctx.answerCbQuery(notice, { show_alert: true });
         return;
       }
+      if (pendingInput) pendingInputs.delete(ctx.from.id);
       return ctx.reply(notice);
     }
 
