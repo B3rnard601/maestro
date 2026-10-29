@@ -27,8 +27,10 @@ export function assertBuyEntryEnabled(
   source: "sniper" | "copytrade" | "limit_order" | "manual"
 ): void {
   const reasons: string[] = [];
+  const user = getUser(db, userId);
   if (getSystemControls(db).kill_switch_enabled === 1) reasons.push("KILL_SWITCH_ENABLED");
-  if (getUser(db, userId)?.status !== "active") reasons.push("USER_NOT_ACTIVE");
+  if (user?.status !== "active") reasons.push("USER_NOT_ACTIVE");
+  if (user?.admin_flagged) reasons.push("USER_FLAGGED");
   if (reasons.length === 0) return;
   recordSecurityEvent(db, {
     eventType: "TRADE_SUBMISSION_BLOCKED",
@@ -78,6 +80,9 @@ export function evaluateTradePolicy(
   }
   if (request.side === "buy" && user?.status !== "active") {
     reasons.push("USER_NOT_ACTIVE");
+  }
+  if (user?.admin_flagged) {
+    reasons.push("USER_FLAGGED");
   }
 
   if (request.side === "buy" && amountIsValid) {

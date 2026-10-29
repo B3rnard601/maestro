@@ -10,7 +10,10 @@ import {
   getAutoSnipeConfig,
   getOrCreateUser,
   listActiveAutoSnipes,
+  listActiveSnipers,
   listAutoSnipesForUser,
+  listAllCopyTargets,
+  listCopyFollowers,
   listPresaleListings,
   openDb,
   recordReferralAttribution,
@@ -124,6 +127,7 @@ test("presales and referral features persist safely", () => {
       details: "Community submission; verify the project independently.",
       created_by: "1",
     });
+
     assert.equal(listPresaleListings(db).length, 1);
     assert.equal(listPresaleListings(db)[0].chain, "solana");
     assert.equal(removePresaleListing(db, "presale-1"), true);
@@ -182,6 +186,34 @@ test("presales and referral features persist safely", () => {
     getOrCreateUser(db, "50", "flagged-referrer", "50");
     db.prepare("UPDATE users SET admin_flagged = 1 WHERE telegram_id = '50'").run();
     assert.equal(recordReferralAttribution(db, "50", "30"), false);
+  } finally {
+    db.close();
+  }
+});
+
+test("flagged users are excluded from automated transaction followers", () => {
+  const db = openDb(":memory:");
+  try {
+    getOrCreateUser(db, "55", "flagged-trader");
+    db.prepare(
+      `UPDATE users
+       SET status = 'active', admin_flagged = 1, snipe_enabled = 1,
+           copy_target = 'target-wallet'
+       WHERE telegram_id = '55'`,
+    ).run();
+    addAutoSnipe(db, {
+      id: "flagged-auto-snipe",
+      userId: "55",
+      chain: "solana",
+      asset: "mint",
+      amount: 0.1,
+      amountExact: "0.1",
+    });
+
+    assert.equal(listActiveSnipers(db, "solana").length, 0);
+    assert.equal(listActiveAutoSnipes(db, "solana", "mint").length, 0);
+    assert.equal(listCopyFollowers(db, "target-wallet").length, 0);
+    assert.deepEqual(listAllCopyTargets(db), []);
   } finally {
     db.close();
   }

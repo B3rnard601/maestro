@@ -1456,7 +1456,7 @@ export function listStalePreparedTrades(db: Database.Database, olderThan: number
  */
 export function listActiveSnipers(db: Database.Database, chain: "solana" | "evm"): UserRow[] {
   return db
-    .prepare(`SELECT * FROM users WHERE status = 'active' AND snipe_enabled = 1`)
+    .prepare(`SELECT * FROM users WHERE status = 'active' AND admin_flagged = 0 AND snipe_enabled = 1`)
     .all() as UserRow[];
 }
 
@@ -1571,11 +1571,11 @@ export function listActiveAutoSnipes(
     ? `SELECT users.*, auto_snipes.amount_exact AS auto_snipe_amount
        FROM auto_snipes JOIN users ON users.telegram_id = auto_snipes.user_id
        WHERE auto_snipes.chain = ? AND lower(auto_snipes.asset) = lower(?)
-         AND auto_snipes.enabled = 1 AND users.status = 'active'`
+         AND auto_snipes.enabled = 1 AND users.status = 'active' AND users.admin_flagged = 0`
     : `SELECT users.*, auto_snipes.amount_exact AS auto_snipe_amount
        FROM auto_snipes JOIN users ON users.telegram_id = auto_snipes.user_id
        WHERE auto_snipes.chain = ? AND auto_snipes.asset = ?
-         AND auto_snipes.enabled = 1 AND users.status = 'active'`;
+         AND auto_snipes.enabled = 1 AND users.status = 'active' AND users.admin_flagged = 0`;
   return db.prepare(query).all(chain, asset) as (UserRow & {
     auto_snipe_amount: string;
   })[];
@@ -1607,13 +1607,13 @@ export function removeAutoSnipe(
 /** Users following a copy-trade target, grouped implicitly by copy_target — the registry queries this per target. */
 export function listCopyFollowers(db: Database.Database, targetWallet: string): UserRow[] {
   return db
-    .prepare(`SELECT * FROM users WHERE status = 'active' AND copy_target = ?`)
+    .prepare(`SELECT * FROM users WHERE status = 'active' AND admin_flagged = 0 AND copy_target = ?`)
     .all(targetWallet) as UserRow[];
 }
 
 export function listAllCopyTargets(db: Database.Database): string[] {
   const rows = db
-    .prepare(`SELECT DISTINCT copy_target FROM users WHERE status = 'active' AND copy_target IS NOT NULL`)
+    .prepare(`SELECT DISTINCT copy_target FROM users WHERE status = 'active' AND admin_flagged = 0 AND copy_target IS NOT NULL`)
     .all() as { copy_target: string }[];
   return rows.map((r) => r.copy_target);
 }
