@@ -506,17 +506,16 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       command,
       callbackData,
       updateType: ctx.updateType,
-      pendingInputKind:
-        text && !text.startsWith("/") ? pendingInput?.kind : undefined,
-      canEnableSnipe:
-        callbackData?.startsWith("home_snipe_toggle_") &&
-        listAutoSnipesForUser(db, user.telegram_id).some(
-          (snipe) =>
-            snipe.id === callbackData.slice("home_snipe_toggle_".length) &&
-            !snipe.enabled,
-        ),
+      isWalletImportInput: Boolean(
+        text && !text.startsWith("/") && pendingImport.has(ctx.from.id),
+      ),
+      isSuccessfulPayment: Boolean(
+        (ctx.message as any)?.successful_payment,
+      ),
     });
     if (user.role !== "admin" && user.admin_flagged && isRestricted) {
+      pendingInputs.delete(ctx.from.id);
+      pendingImport.delete(ctx.from.id);
       const notice = adminFlagNotice(user.admin_flag_message);
       if (ctx.updateType === "pre_checkout_query") {
         await ctx.answerPreCheckoutQuery(false, notice);
