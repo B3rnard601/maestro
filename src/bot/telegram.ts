@@ -41,6 +41,7 @@ import {
   cancelPremiumPriceAlert,
   createPremiumPriceAlert,
   getAutoSnipeConfig,
+  getWalletBalanceDisplayOverride,
   getHoldings,
   getPremiumAccess,
   getPremiumStarsPrice,
@@ -53,6 +54,7 @@ import {
   setUserStatus,
   setUserAdminFlag,
   setKillSwitch,
+  setWalletBalanceDisplayOverride,
   updateUserSettings,
   listWalletsFor,
   getWallet,
@@ -68,6 +70,7 @@ import {
   setPremiumStarsPrice,
   validatePremiumInvoice,
   getPrimaryWallet,
+  type WalletRow,
   recordHolding,
   recordSecurityEvent,
   listRecentTradesForUser,
@@ -670,6 +673,11 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         kind: "admin_flag_user";
         step: "user_id" | "message";
         telegramId?: string;
+      }
+    | {
+        kind: "admin_balance_override";
+        walletId: string;
+        chain: "solana" | "evm";
       }
     | { kind: "admin_unflag_user" };
 
@@ -2291,9 +2299,114 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         ],
         [Markup.button.callback("🧾 Recent risk audit", "home_admin_audit")],
         [Markup.button.callback("🔔 Manage presales", "home_admin_presales")],
+        [Markup.button.callback("🧮 Edit my display balances", "home_admin_balance")],
         [Markup.button.callback("↩️ Home", "home")],
       ]),
     );
+  });
+
+  bot.action("home_admin_balance", async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    const wallets = listWalletsFor(db, String(ctx.from!.id));
+    if (wallets.length === 0) {
+      return ctx.reply(
+        "Import a wallet before editing its displayed native balance.",
+        Markup.inlineKeyboard([
+          [Markup.button.callback("💼 Wallets", "home_wallets")],
+          [Markup.button.callback("↩️ Admin", "home_admin")],
+        ]),
+      );
+    }
+
+    await ctx.reply(
+      "Choose one of your wallets. This changes only the portfolio display; it does not change on-chain funds or affect trading.",
+      Markup.inlineKeyboard([
+        ...wallets.map((wallet) => [
+          Markup.button.callback(
+            `${wallet.chain === "solana" ? "SOL" : "ETH"} · ${wallet.label}`,
+            `admin_balance_select_${wallet.chain}_${wallet.label}`,
+          ),
+        ]),
+        [Markup.button.callback("↩️ Admin", "home_admin")],
+      ]),
+    );
+  });
+
+  bot.action(/^admin_balance_select_(solana|evm)_(wallet-\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    const [, chain, label] = ctx.match as unknown as [
+      string,
+      "solana" | "evm",
+      string,
+    ];
+    const wallet = getWallet(db, String(ctx.from!.id), chain, label);
+    if (!wallet) return ctx.reply("That wallet is no longer available.");
+    const override = getWalletBalanceDisplayOverride(
+      db,
+      String(ctx.from!.id),
+      wallet.id,
+    );
+    const currency = wallet.chain === "solana" ? "SOL" : "ETH";
+    await ctx.reply(
+      `Displayed ${currency} balance for "${wallet.label}": ${override?.amount ?? "using tracked balance"}\n\nManual overrides are display-only and do not represent on-chain funds.`,
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            `Set displayed ${currency} balance`,
+            `admin_balance_set_${wallet.chain}_${wallet.label}`,
+          ),
+        ],
+        ...(override
+          ? [[Markup.button.callback("Reset to tracked balance", `admin_balance_clear_${wallet.chain}_${wallet.label}`)]]
+          : []),
+        [Markup.button.callback("↩️ Choose wallet", "home_admin_balance")],
+      ]),
+    );
+  });
+
+  bot.action(/^admin_balance_set_(solana|evm)_(wallet-\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    const [, chain, label] = ctx.match as unknown as [
+      string,
+      "solana" | "evm",
+      string,
+    ];
+    const wallet = getWallet(db, String(ctx.from!.id), chain, label);
+    if (!wallet) return ctx.reply("That wallet is no longer available.");
+    pendingInputs.set(ctx.from!.id, {
+      kind: "admin_balance_override",
+      walletId: wallet.id,
+      chain: wallet.chain,
+    });
+    const currency = wallet.chain === "solana" ? "SOL" : "ETH";
+    await ctx.reply(
+      `Send the displayed ${currency} balance for "${wallet.label}" (non-negative, up to ${wallet.chain === "solana" ? 9 : 18} decimal places). This is only a display override; it does not change actual funds or trading.`,
+      cancelPromptKeyboard,
+    );
+  });
+
+  bot.action(/^admin_balance_clear_(solana|evm)_(wallet-\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!requireAdmin(ctx)) return;
+    const [, chain, label] = ctx.match as unknown as [
+      string,
+      "solana" | "evm",
+      string,
+    ];
+    const wallet = getWallet(db, String(ctx.from!.id), chain, label);
+    if (!wallet) return ctx.reply("That wallet is no longer available.");
+    setWalletBalanceDisplayOverride(db, {
+      actorUserId: String(ctx.from!.id),
+      walletId: wallet.id,
+      amount: null,
+    });
+    await ctx.reply(
+      `Displayed ${wallet.chain === "solana" ? "SOL" : "ETH"} balance reset to the tracked value. This does not affect on-chain funds.`,
+    );
+    await sendChainWalletGrid(ctx, wallet.chain);
   });
 
   bot.action("home_admin_presales", async (ctx) => {
@@ -2703,14 +2816,33 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
 
   function fundingSummaryLines(
     assets: Awaited<ReturnType<typeof updateWalletFunding>>,
+    wallet?: WalletRow,
   ): string[] {
-    if (assets.length === 0) return ["🟡 Balance tracking not initialized"];
-    return assets
+    const override = wallet
+      ? getWalletBalanceDisplayOverride(db, wallet.user_id, wallet.id)
+      : null;
+    if (assets.length === 0 && !override) {
+      return ["🟡 Balance tracking not initialized"];
+    }
+    const lines = assets
       .sort((left, right) => Number(right.assetId === "native") - Number(left.assetId === "native"))
       .map((asset) => {
+        if (asset.assetId === "native" && override) {
+          const decimals = wallet!.chain === "solana" ? 9 : 18;
+          const units = parseUnitsExact(override.amount, decimals);
+          return `  💰 ${formatFundingAmount(units.toString(), decimals)} ${asset.symbol}`;
+        }
         const totalUnits = BigInt(asset.initialUnits) + BigInt(asset.receivedUnits);
         return `  ${asset.assetId === "native" ? "💰" : "🪙"} ${formatFundingAmount(totalUnits.toString(), asset.decimals)} ${asset.symbol}`;
       });
+    if (override && !assets.some((asset) => asset.assetId === "native")) {
+      const decimals = wallet!.chain === "solana" ? 9 : 18;
+      const units = parseUnitsExact(override.amount, decimals);
+      lines.unshift(
+        `  💰 ${formatFundingAmount(units.toString(), decimals)} ${wallet!.chain === "solana" ? "SOL" : "ETH"}`,
+      );
+    }
+    return lines;
   }
 
   // Catches the seed-phrase/private-key text message that follows an import action.
@@ -2803,6 +2935,43 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
         pendingInputs.set(ctx.from!.id, pendingInput);
         await ctx.reply(prompt, cancelPromptKeyboard);
       };
+
+      if (pendingInput.kind === "admin_balance_override") {
+        if (!requireAdmin(ctx)) return;
+        const wallet = listWalletsFor(db, String(ctx.from!.id)).find(
+          (entry) => entry.id === pendingInput.walletId,
+        );
+        if (!wallet) {
+          return ctx.reply("That wallet is no longer available.");
+        }
+        const decimals = wallet.chain === "solana" ? 9 : 18;
+        const currency = wallet.chain === "solana" ? "SOL" : "ETH";
+        if (!isNonNegativeDecimal(input, decimals)) {
+          return keepPrompt(
+            `Enter a non-negative ${currency} amount with at most ${decimals} decimal places.`,
+          );
+        }
+        try {
+          setWalletBalanceDisplayOverride(db, {
+            actorUserId: String(ctx.from!.id),
+            walletId: wallet.id,
+            amount: input,
+          });
+        } catch (err) {
+          console.error(
+            `[admin] couldn't set display balance for wallet ${wallet.id}:`,
+            err,
+          );
+          return ctx.reply(
+            `Couldn't set the display balance: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        await ctx.reply(
+          `Displayed ${currency} balance set to ${input}. This is a display override only; actual on-chain funds and trading are unchanged.`,
+        );
+        await sendChainWalletGrid(ctx, wallet.chain);
+        return;
+      }
 
       if (pendingInput.kind === "bridge_amount") {
         const decimals = pendingInput.fromChain === "solana" ? 9 : 18;
@@ -3632,6 +3801,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
       try {
         fundingLines = fundingSummaryLines(
           await updateWalletFunding(db, w, solConnection, evmHttpProvider),
+          w,
         );
       } catch (err) {
         console.error(`[funding] couldn't update ${chain} totals for ${w.label}:`, err);
@@ -3833,6 +4003,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           lines.push(
             ...fundingSummaryLines(
               await updateWalletFunding(db, w, solConnection, evmHttpProvider),
+              w,
             ),
           );
         } catch (err) {
@@ -3852,6 +4023,7 @@ export function createBot(token: string, deps: BotDeps): Telegraf {
           lines.push(
             ...fundingSummaryLines(
               await updateWalletFunding(db, w, solConnection, evmHttpProvider),
+              w,
             ),
           );
         } catch (err) {

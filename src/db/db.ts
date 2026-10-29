@@ -2,7 +2,13 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { formatUnitsExact, numberToDecimalString, parseUnitsFloor } from "../shared/amount.js";
+import {
+  formatUnitsExact,
+  isNonNegativeDecimal,
+  numberToDecimalString,
+  parseUnitsExact,
+  parseUnitsFloor,
+} from "../shared/amount.js";
 
 export function openDb(filePath = "./data/bot.db"): Database.Database {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -100,6 +106,15 @@ export function openDb(filePath = "./data/bot.db"): Database.Database {
       is_primary INTEGER NOT NULL DEFAULT 0,    -- the wallet auto-trading (snipe/copy/limit orders) uses
       created_at INTEGER NOT NULL,
       UNIQUE(user_id, chain, label)
+    );
+
+    CREATE TABLE IF NOT EXISTS wallet_balance_display_overrides (
+      wallet_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      chain TEXT NOT NULL CHECK(chain IN ('solana','evm')),
+      amount TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      updated_by TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS wallet_import_events (
@@ -898,6 +913,107 @@ export function getWallet(db: Database.Database, userId: string, chain: "solana"
   return (db.prepare(`SELECT * FROM wallets WHERE user_id = ? AND chain = ? AND label = ?`).get(userId, chain, label) as WalletRow) ?? null;
 }
 
+export interface WalletBalanceDisplayOverride {
+  wallet_id: string;
+  user_id: string;
+  chain: "solana" | "evm";
+  amount: string;
+  updated_at: number;
+  updated_by: string;
+}
+
+export function getWalletBalanceDisplayOverride(
+  db: Database.Database,
+  userId: string,
+  walletId: string,
+): WalletBalanceDisplayOverride | null {
+  return (
+    (db
+      .prepare(
+        `SELECT * FROM wallet_balance_display_overrides
+         WHERE user_id = ? AND wallet_id = ?`,
+      )
+      .get(userId, walletId) as WalletBalanceDisplayOverride | undefined) ?? null
+  );
+}
+
+export function setWalletBalanceDisplayOverride(
+  db: Database.Database,
+  input: {
+    actorUserId: string;
+    walletId: string;
+    amount: string | null;
+  },
+): void {
+  const actor = getUser(db, input.actorUserId);
+  if (actor?.role !== "admin") {
+    throw new Error("Only admins can edit wallet display balances.");
+  }
+  const wallet = db
+    .prepare(`SELECT * FROM wallets WHERE id = ? AND user_id = ?`)
+    .get(input.walletId, input.actorUserId) as WalletRow | undefined;
+  if (!wallet) {
+    throw new Error("You can only edit the display balance of your own wallet.");
+  }
+
+  if (input.amount !== null) {
+    const decimals = wallet.chain === "solana" ? 9 : 18;
+    if (!isNonNegativeDecimal(input.amount, decimals)) {
+      throw new Error(
+        `Balance must be a non-negative decimal with at most ${decimals} fractional digits.`,
+      );
+    }
+    parseUnitsExact(input.amount, decimals);
+  }
+
+  const now = Date.now();
+  const transaction = db.transaction(() => {
+    if (input.amount === null) {
+      db.prepare(
+        `DELETE FROM wallet_balance_display_overrides
+         WHERE wallet_id = ? AND user_id = ?`,
+      ).run(wallet.id, input.actorUserId);
+    } else {
+      db.prepare(
+        `INSERT INTO wallet_balance_display_overrides
+          (wallet_id, user_id, chain, amount, updated_at, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(wallet_id) DO UPDATE SET
+           user_id = excluded.user_id,
+           chain = excluded.chain,
+           amount = excluded.amount,
+           updated_at = excluded.updated_at,
+           updated_by = excluded.updated_by`,
+      ).run(
+        wallet.id,
+        input.actorUserId,
+        wallet.chain,
+        input.amount,
+        now,
+        input.actorUserId,
+      );
+    }
+    recordSecurityEvent(db, {
+      eventType:
+        input.amount === null
+          ? "ADMIN_WALLET_DISPLAY_BALANCE_CLEARED"
+          : "ADMIN_WALLET_DISPLAY_BALANCE_SET",
+      actorUserId: input.actorUserId,
+      subjectUserId: input.actorUserId,
+      chain: wallet.chain,
+      amount: input.amount ?? undefined,
+      source: "admin_display_override",
+      details: {
+        walletId: wallet.id,
+        displayOnly: true,
+        affectsOnChainBalance: false,
+        affectsTransactions: false,
+      },
+    });
+  });
+  transaction();
+}
+
 export function getPrimaryWallet(db: Database.Database, userId: string, chain: "solana" | "evm"): WalletRow | null {
   return (db.prepare(`SELECT * FROM wallets WHERE user_id = ? AND chain = ? AND is_primary = 1`).get(userId, chain) as WalletRow) ?? null;
 }
@@ -925,6 +1041,7 @@ export function deleteWallet(db: Database.Database, userId: string, chain: "sola
   const target = getWallet(db, userId, chain, label);
   if (!target) throw new Error("No such wallet");
 
+  db.prepare(`DELETE FROM wallet_balance_display_overrides WHERE wallet_id = ?`).run(target.id);
   db.prepare(`DELETE FROM wallet_funding_events WHERE wallet_id = ?`).run(target.id);
   db.prepare(`DELETE FROM wallet_funding_assets WHERE wallet_id = ?`).run(target.id);
   db.prepare(`DELETE FROM wallet_funding_cursors WHERE wallet_id = ?`).run(target.id);
